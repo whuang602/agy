@@ -6,6 +6,8 @@ This directory contains customizations and tooling for the Google Antigravity (A
 
 To interactively configure and install customizations (such as the Git status line and session/round timers):
 
+https://github.com/user-attachments/assets/5c1a955e-ceef-4b76-9d6b-408d4d14f1e1
+
 ```bash
 chmod +x CLI/customization/install.sh
 ./CLI/customization/install.sh
