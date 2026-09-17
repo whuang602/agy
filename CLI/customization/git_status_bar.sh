@@ -11,9 +11,19 @@ GRAY="\033[90m"
 RED="\033[31m"
 RESET="\033[0m"
 
-# --- Target Directory ---
-TARGET_DIR="${1:-$PWD}"
-[ ! -d "$TARGET_DIR" ] && TARGET_DIR="$PWD"
+# --- Parse Arguments ---
+SEGMENT_MODE=false
+TARGET_DIR=""
+
+for arg in "$@"; do
+    if [ "$arg" = "--segment" ]; then
+        SEGMENT_MODE=true
+    elif [ -z "$TARGET_DIR" ] && [ -d "$arg" ]; then
+        TARGET_DIR="$arg"
+    fi
+done
+
+[ -z "$TARGET_DIR" ] && TARGET_DIR="$PWD"
 
 # --- Detect True Terminal Width ---
 # AGY runs this command in a background pipe, so we query /dev/tty directly
@@ -26,11 +36,16 @@ fi
 
 # If not in a git repo, display a clean placeholder border
 if ! git -C "$TARGET_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    CONTENT=" Git: not a repository "
-    PAD_LEN=$(( WIDTH - 6 - ${#CONTENT} ))
+    CONTENT="${RED}Git: not a repository${RESET}"
+    RAW_CONTENT="Git: not a repository"
+    if [ "$SEGMENT_MODE" = true ]; then
+        printf "%b\t%s\n" "$CONTENT" "$RAW_CONTENT"
+        exit 0
+    fi
+    PAD_LEN=$(( WIDTH - 6 - ${#RAW_CONTENT} ))
     [ $PAD_LEN -lt 2 ] && PAD_LEN=2
     FILL=$(printf '─%.0s' $(seq 1 $PAD_LEN))
-    echo -e "${GRAY}───[${RED}${CONTENT}${GRAY}]${FILL}${RESET}"
+    echo -e "${GRAY}───[ ${CONTENT} ${GRAY}]${FILL}${RESET}"
     exit 0
 fi
 
@@ -92,17 +107,22 @@ fi
 SEP=" ${GRAY}│${RESET} "
 RAW_SEP=" │ "
 
-CONTENT=" ${SEG_BRANCH}${SEP}${SEG_STAGED}${SEP}${SEG_UNSTAGED}${SEP}${SEG_UNPUSHED} "
-RAW_CONTENT=" ${RAW_BRANCH}${RAW_SEP}${RAW_STAGED}${RAW_SEP}${RAW_UNSTAGED}${RAW_SEP}${RAW_UNPUSHED} "
+CONTENT="${SEG_BRANCH}${SEP}${SEG_STAGED}${SEP}${SEG_UNSTAGED}${SEP}${SEG_UNPUSHED}"
+RAW_CONTENT="${RAW_BRANCH}${RAW_SEP}${RAW_STAGED}${RAW_SEP}${RAW_UNSTAGED}${RAW_SEP}${RAW_UNPUSHED}"
+
+if [ "$SEGMENT_MODE" = true ]; then
+    printf "%b\t%s\n" "$CONTENT" "$RAW_CONTENT"
+    exit 0
+fi
 
 # Calculate trailing line fill to span full terminal width
 PREFIX_LEN=4  # length of "───["
 SUFFIX_LEN=1  # length of "]"
-RAW_TOTAL=$(( PREFIX_LEN + ${#RAW_CONTENT} + SUFFIX_LEN ))
+RAW_TOTAL=$(( PREFIX_LEN + 1 + ${#RAW_CONTENT} + 1 + SUFFIX_LEN ))
 
 FILL_LEN=$(( WIDTH - RAW_TOTAL ))
 [ $FILL_LEN -lt 2 ] && FILL_LEN=2
 
 LINE_FILL=$(printf '─%.0s' $(seq 1 $FILL_LEN))
 
-echo -e "${GRAY}───[${RESET}${CONTENT}${GRAY}]${LINE_FILL}${RESET}"
+echo -e "${GRAY}───[ ${RESET}${CONTENT} ${GRAY}]${LINE_FILL}${RESET}"
