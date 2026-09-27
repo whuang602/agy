@@ -22,11 +22,13 @@ import stat
 import tempfile
 import fcntl
 import unicodedata
+import copy
 import argparse
+import hashlib
 from datetime import datetime
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple, Set
+from typing import Optional, List, Dict, Any, Tuple, Set, Callable, Union
 
 DEFAULT_CONFIG_PATH = os.environ.get("AGY_MCP_CONFIG") or os.path.expanduser("~/.gemini/config/mcp_config.json")
 DEFAULT_MCP_CACHE_DIR = os.path.expanduser("~/.gemini/antigravity-cli/mcp")
@@ -202,8 +204,167 @@ def sanitize_display(s: str) -> str:
     return _CTRL_RE.sub('\ufffd', s)
 
 
-_SENSITIVE_QUERY_PARAMS = {
-    "token", "access_token", "api_key", "key", "secret", "password", "sig", "signature"
+MASK_SECRET = "●●●●●●●●"
+MASK_PLACEHOLDER = MASK_SECRET
+
+_TOKEN_ALTS = (
+    r"sk-[A-Za-z0-9_-]{8,}",
+    r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{15,}",
+    r"xox[baprs]-[0-9A-Za-z-]{20,}",
+    r"bot[0-9]+:[A-Za-z0-9_-]+",
+    r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+    r"AKIA[0-9A-Z]{16}",
+)
+_TOKEN_SEARCH_RE = re.compile(r"(?<![A-Za-z0-9_-])(?:" + "|".join(_TOKEN_ALTS) + ")")
+_TARGETED_TOKEN_PATTERNS = [re.compile(f"^(?:{a})$") for a in _TOKEN_ALTS]
+
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+_SENSITIVE_FLAG_RE = re.compile(
+    r"^--?(?!(?:no|disable|skip|without)[-_])(?:[a-zA-Z0-9]+[-_])*(?:token|secret|password|passwd|passphrase|api[-_]?key|auth|bearer|credential|cookie|session|private[-_]?key|sig|signature|pass|pat|pwd|key)$"
+    r"|^--?[a-z][a-zA-Z0-9]*(?:Token|Secret|Password|Passphrase|ApiKey|PrivateKey|Credential|Cookie|Session|Sig|Signature|Pass|Pat|Pwd|Key)"
+    r"|^--?(?:[a-zA-Z0-9]+[-_])*key$",
+    re.IGNORECASE,
+)
+
+FLAG_ARG_RE = re.compile(
+    r'(^|\s)(--?[A-Za-z0-9][A-Za-z0-9_-]*)(?:(=)("[^"]*"|\'[^\']*\'|\S+)|(\s+)(?!-)("[^"]*"|\'[^\']*\'|\S+))'
+)
+_STANDALONE_FLAG_RE = re.compile(r"^--?[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_STRUCTURAL_FLAGS = {"-H", "--header", "-header", "-u", "--user", "-U", "--proxy-user", "-e", "--env", "-env"}
+
+_SENSITIVE_WORDS_EXACT = {
+    'token', 'secret', 'password', 'passwd', 'key', 'apikey', 'credential',
+    'auth', 'bearer', 'sig', 'signature', 'cert', 'certificate', 'private',
+    'passphrase', 'code', 'session', 'pass', 'pat', 'pwd',
+    'authorization', 'cookie', 'cookies', 'session_id', 'session-id'
+}
+
+_SENSITIVE_SUBSTRINGS_CLEANED = {
+    'secret', 'password', 'passwd', 'passphrase', 'credential',
+    'privatekey', 'apikey', 'accesstoken', 'clientsecret',
+    'authorization', 'cookie', 'cookies', 'sessionid'
+}
+
+def _is_inside_git_repo(path: str) -> bool:
+    try:
+        cur = os.path.realpath(path)
+        if not os.path.isdir(cur):
+            cur = os.path.dirname(cur)
+        while cur and cur != os.path.dirname(cur):
+            if os.path.exists(os.path.join(cur, ".git")):
+                return True
+            cur = os.path.dirname(cur)
+    except Exception:
+        pass
+    return False
+
+def _find_unclosed_quote(buf: str) -> Optional[Tuple[int, str]]:
+    """Finds index and quote char of the unclosed quote, or None if quotes are balanced."""
+    state = None
+    quote_idx = -1
+    i = 0
+    n = len(buf)
+    while i < n:
+        c = buf[i]
+        if state is None:
+            if c == "\\":
+                i += 2
+                continue
+            elif c in ('"', "'"):
+                state = c
+                quote_idx = i
+        elif state == '"':
+            if c == "\\":
+                i += 2
+                continue
+            elif c == '"':
+                state = None
+                quote_idx = -1
+        elif state == "'":
+            if c == "'":
+                state = None
+                quote_idx = -1
+        i += 1
+    if state is not None:
+        return quote_idx, state
+    return None
+
+def _is_sensitive_param_name(name: str) -> bool:
+    if not name or not isinstance(name, str):
+        return False
+    name_l = name.lower()
+    if name_l in _SENSITIVE_WORDS_EXACT:
+        return True
+    parts = re.split(r'[^A-Za-z0-9]+', name)
+    tokens: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        camel_parts = re.findall(r'[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+', part)
+        if camel_parts:
+            tokens.extend(w.lower() for w in camel_parts)
+        else:
+            tokens.append(part.lower())
+    if any(t in _SENSITIVE_WORDS_EXACT for t in tokens):
+        return True
+    cleaned = re.sub(r'[^a-z0-9]', '', name_l)
+    if any(s in cleaned for s in _SENSITIVE_SUBSTRINGS_CLEANED):
+        return True
+    return False
+
+
+def _flag_name(arg: str) -> str:
+    """Strips leading dashes and anything after = to extract the flag name."""
+    if not isinstance(arg, str):
+        return ""
+    flag = arg.partition("=")[0].strip()
+    return re.sub(r'^-+', '', flag)
+
+
+def _is_sensitive_flag(flag: str) -> bool:
+    """Checks if a CLI flag is sensitive, rejecting negation prefixes."""
+    if not isinstance(flag, str) or not flag:
+        return False
+    norm = _flag_name(flag)
+    if not norm:
+        return False
+    if re.match(r'^(?:no|disable|skip|without)[-_]', norm, re.IGNORECASE):
+        return False
+    if norm.lower() in ("maxtokens", "max-tokens"):
+        return False
+    return _is_sensitive_param_name(norm)
+
+
+_SENSITIVE_KEY_RE = _SENSITIVE_FLAG_RE
+_ATTACHED_USER_RE = re.compile(r'(?i)(^|\s)(-u|--user)(["\'])([^":]*):([^"\']*)(\3)')
+
+def _mask_userinfo(user: str, pw: Optional[str] = None) -> str:
+    """Masks credentials in userinfo slots, protecting tokens in user-slot."""
+    if pw is None:
+        return MASK_SECRET
+    if pw == "":
+        return f"{MASK_SECRET}:"
+    user_dec = urllib.parse.unquote(user) if isinstance(user, str) else ""
+    if len(pw) <= 1 or pw.lower() in {"x", "x-oauth-basic", "api_token", "token"}:
+        return f"{MASK_SECRET}:{MASK_SECRET}"
+    user_is_token = (
+        _is_token_shaped(user)
+        or _is_token_shaped(user_dec)
+        or bool(_TOKEN_SEARCH_RE.search(user))
+        or bool(_TOKEN_SEARCH_RE.search(user_dec))
+    )
+    if user_is_token:
+        return f"{MASK_SECRET}:{MASK_SECRET}"
+    else:
+        return f"{user}:{MASK_SECRET}"
+
+_ALLOWLISTED_KEYS = {
+    "authProviderType", "transport", "command", "args", "env", "headers",
+    "serverUrl", "url", "toolConfig", "eager", "background", "timeoutSeconds",
+    "timeout", "bypassSandbox", "skipToolNamePrefix", "disabled", "name",
+    "clientId", "client_id", "oauthClientId", "oauth_client_id",
+    "path", "maxTokens", "max_tokens", "tokens", "bypass_sandbox"
 }
 
 _PUBLIC_HEADERS_ALLOWLIST = {
@@ -216,93 +377,862 @@ _PUBLIC_HEADERS_ALLOWLIST = {
     "mcp-protocol-version",
 }
 
-_RFC9110_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+-.^_`|~]+$")
+_RFC9110_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
+
+
+def _redact_header_str(h: str) -> str:
+    """Redacts bearer tokens or sensitive header values in header string representations."""
+    colon_idx = h.find(":")
+    equal_idx = h.find("=")
+    if colon_idx != -1 and equal_idx != -1:
+        sep_idx = min(colon_idx, equal_idx)
+    elif colon_idx != -1:
+        sep_idx = colon_idx
+    elif equal_idx != -1:
+        sep_idx = equal_idx
+    else:
+        sep_idx = -1
+
+    if sep_idx != -1:
+        sep = h[sep_idx]
+        name = h[:sep_idx]
+        val = h[sep_idx + 1:]
+        name_clean = name.strip()
+        name_lower = name_clean.lower()
+        if name_lower in ("authorization", "proxy-authorization"):
+            bearer_match = re.match(r"^(\s*(?:Bearer|Basic|Token)\s+)(.+)$", val, re.IGNORECASE)
+            if bearer_match:
+                prefix = bearer_match.group(1)
+                return f"{name}{sep}{prefix}{MASK_PLACEHOLDER}"
+            else:
+                leading_ws = len(val) - len(val.lstrip())
+                return f"{name}{sep}{val[:leading_ws]}{MASK_PLACEHOLDER}"
+        elif _is_sensitive_param_name(name_clean) or name_lower not in _PUBLIC_HEADERS_ALLOWLIST:
+            leading_ws = len(val) - len(val.lstrip())
+            return f"{name}{sep}{val[:leading_ws]}{MASK_PLACEHOLDER}"
+        else:
+            return h
+    return redact_url_or_cmd(h)
+
+
+_URL_QUERY_SENSITIVE_RE = re.compile(
+    r'(?i)([?&#])((?:[a-zA-Z0-9]+[-_])*(?:token|secret|password|passwd|key|apikey|credential|auth|bearer|sig|signature|cert|certificate|private|passphrase|code|session|pat|pwd)(?:[-_][a-zA-Z0-9]*)?=)[^&#\s]*'
+)
+
+
+def _is_token_shaped(s: str) -> bool:
+    """Checks if a string matches high-precision token or secret shapes."""
+    if not isinstance(s, str) or not s:
+        return False
+    s_clean = s.strip("'\"")
+    if not s_clean:
+        return False
+    if s_clean.startswith("-"):
+        return False
+    if any(pat.fullmatch(s_clean) for pat in _TARGETED_TOKEN_PATTERNS):
+        return True
+    if _UUID_RE.fullmatch(s_clean):
+        return False
+    if len(s_clean) >= 24 and re.fullmatch(r"[0-9a-zA-Z_-]+", s_clean):
+        parts = s_clean.split("-")
+        if len(parts) > 1 and all(len(p) <= 15 for p in parts):
+            return False
+        return True
+    return False
 
 
 def _redact_single_url(url_str: str) -> str:
+    if not isinstance(url_str, str):
+        return url_str
+    s = url_str.strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+", s):
+        return redact_secretish(url_str)
+
+    lead_ws = url_str[:len(url_str) - len(url_str.lstrip())]
+    trail_ws = url_str[len(url_str.rstrip()):]
+
     try:
-        parts = urllib.parse.urlsplit(url_str)
+        m_proto = re.match(r'^([A-Za-z][A-Za-z0-9+.\-]*://)(\S+)(.*)$', s)
+        if m_proto:
+            scheme_prefix = m_proto.group(1)
+            rest = m_proto.group(2)
+            trailing = m_proto.group(3)
+
+            # Find auth_end: first /, ?, or #
+            m_delim = re.search(r"[/\\?#]", rest)
+            auth_end = m_delim.start() if m_delim else len(rest)
+            auth_part = rest[:auth_end]
+            path_and_rest = rest[auth_end:]
+
+            if "@" in auth_part:
+                userinfo, host = auth_part.rsplit("@", 1)
+                if ":" in userinfo:
+                    u, pw = userinfo.split(":", 1)
+                    masked_uinfo = _mask_userinfo(u, pw)
+                else:
+                    masked_uinfo = MASK_SECRET
+                s = f"{scheme_prefix}{masked_uinfo}@{host}{path_and_rest}{trailing}"
+            elif not rest.startswith("[") and ":" in auth_part:
+                u_cand, p_cand = auth_part.split(":", 1)
+                if not p_cand.isdigit():
+                    m_at = re.search(r"@(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?=[:/?#]|$)", rest)
+                    if m_at:
+                        uinfo = rest[:m_at.start()]
+                        if ":" in uinfo:
+                            u, pw = uinfo.split(":", 1)
+                            masked_uinfo = _mask_userinfo(u, pw)
+                        else:
+                            masked_uinfo = MASK_SECRET
+                        s = f"{scheme_prefix}{masked_uinfo}@{rest[m_at.start()+1:]}{trailing}"
+
+        parts = urllib.parse.urlsplit(s)
         if not parts.scheme:
-            return url_str
+            return redact_secretish(url_str)
         new_netloc = parts.netloc
         if "@" in parts.netloc:
             userinfo, host = parts.netloc.rsplit("@", 1)
             if ":" in userinfo:
-                user, _ = userinfo.split(":", 1)
-                new_userinfo = f"{user}:••••••••"
+                user, pw = userinfo.split(":", 1)
+                new_userinfo = _mask_userinfo(user, pw)
             else:
-                new_userinfo = "••••••••"
+                new_userinfo = MASK_SECRET
             new_netloc = f"{new_userinfo}@{host}"
+        elif ":" in parts.netloc and not parts.netloc.startswith("["):
+            user_or_host, pw_or_port = parts.netloc.rsplit(":", 1)
+            if not pw_or_port.isdigit():
+                new_netloc = _mask_userinfo(user_or_host, pw_or_port)
+
+        new_path_segments = []
+        for seg in parts.path.split("/"):
+            unquoted = urllib.parse.unquote(seg)
+            if seg and (_is_token_shaped(seg) or _is_token_shaped(unquoted) or bool(_TOKEN_SEARCH_RE.search(unquoted))):
+                new_path_segments.append(MASK_SECRET)
+            else:
+                new_path_segments.append(seg)
+        new_path = "/".join(new_path_segments)
 
         new_query = parts.query
         if parts.query:
-            query_pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+            raw_pairs = parts.query.split("&")
             new_pairs = []
-            for k, v in query_pairs:
-                if k.lower() in _SENSITIVE_QUERY_PARAMS:
-                    new_pairs.append((k, "••••••••"))
+            for item in raw_pairs:
+                if "=" in item:
+                    k_raw, v_raw = item.partition("=")[0], item.partition("=")[2]
+                    k_dec = urllib.parse.unquote(k_raw)
+                    v_dec = urllib.parse.unquote(v_raw)
+                    is_sens = (
+                        _is_sensitive_param_name(k_dec)
+                        or _is_token_shaped(v_raw)
+                        or _is_token_shaped(v_dec)
+                        or bool(_TOKEN_SEARCH_RE.search(v_dec))
+                    )
+                    if not is_sens and "://" in v_dec:
+                        is_sens = (_redact_single_url(v_dec) != v_dec)
+                    if is_sens:
+                        new_pairs.append(f"{k_raw}={MASK_SECRET}")
+                    else:
+                        new_pairs.append(item)
                 else:
-                    new_pairs.append((k, v))
-            new_query = "&".join(f"{k}={v}" if v else k for k, v in new_pairs)
+                    k_dec = urllib.parse.unquote(item)
+                    if _is_sensitive_param_name(k_dec) or _is_token_shaped(item) or _is_token_shaped(k_dec) or bool(_TOKEN_SEARCH_RE.search(k_dec)):
+                        new_pairs.append(MASK_SECRET)
+                    else:
+                        new_pairs.append(item)
+            new_query = "&".join(new_pairs)
 
-        new_parts = parts._replace(netloc=new_netloc, query=new_query)
-        return urllib.parse.urlunsplit(new_parts)
+        new_fragment = parts.fragment
+        if parts.fragment:
+            if "=" in parts.fragment:
+                raw_pairs = parts.fragment.split("&")
+                new_pairs = []
+                for item in raw_pairs:
+                    if "=" in item:
+                        k_raw, v_raw = item.partition("=")[0], item.partition("=")[2]
+                        k_dec = urllib.parse.unquote(k_raw)
+                        v_dec = urllib.parse.unquote(v_raw)
+                        is_sens = (
+                            _is_sensitive_param_name(k_dec)
+                            or _is_token_shaped(v_raw)
+                            or _is_token_shaped(v_dec)
+                            or bool(_TOKEN_SEARCH_RE.search(v_dec))
+                        )
+                        if not is_sens and "://" in v_dec:
+                            is_sens = (_redact_single_url(v_dec) != v_dec)
+                        if is_sens:
+                            new_pairs.append(f"{k_raw}={MASK_SECRET}")
+                        else:
+                            new_pairs.append(item)
+                    else:
+                        k_dec = urllib.parse.unquote(item)
+                        if _is_sensitive_param_name(k_dec) or _is_token_shaped(item) or _is_token_shaped(k_dec) or bool(_TOKEN_SEARCH_RE.search(k_dec)):
+                            new_pairs.append(MASK_SECRET)
+                        else:
+                            new_pairs.append(item)
+                new_fragment = "&".join(new_pairs)
+            else:
+                frag_unquoted = urllib.parse.unquote(parts.fragment)
+                if (
+                    _is_sensitive_param_name(parts.fragment)
+                    or _is_token_shaped(parts.fragment)
+                    or _is_token_shaped(frag_unquoted)
+                    or bool(_TOKEN_SEARCH_RE.search(frag_unquoted))
+                ):
+                    new_fragment = MASK_SECRET
+
+        new_parts = parts._replace(netloc=new_netloc, path=new_path, query=new_query, fragment=new_fragment)
+        res_url = urllib.parse.urlunsplit(new_parts)
+        res_url = _URL_QUERY_SENSITIVE_RE.sub(rf'\1\2{MASK_SECRET}', res_url)
+        return f"{lead_ws}{res_url}{trail_ws}"
     except Exception:
-        return url_str
+        m_proto = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*://)", s)
+        prefix = m_proto.group(1) if m_proto else ""
+        return f"{lead_ws}{prefix}{MASK_SECRET}{trail_ws}"
 
 
 def redact_url_or_cmd(text: str) -> str:
     """Redacts credentials and sensitive query parameters in URLs and commands."""
     if not isinstance(text, str):
         return text
-    url_pattern = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"'<>]+")
+    url_pattern = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s\"'<>]+")
     return url_pattern.sub(lambda m: _redact_single_url(m.group(0)), text)
 
 
-def redact_secretish(text: str) -> str:
-    """Masks token-shaped and secret-shaped CLI flags (--token=..., --api-key ..., etc.)."""
+def _mask_malformed_json(s: str) -> str:
+    """Masks sensitive fields in malformed JSON blobs failing json.loads."""
+    masked = re.sub(
+        r'(?i)"([^"]*(?:token|secret|password|passwd|pass|key|api[-_]?key|auth|bearer|credential|pat|private[-_]?key)[^"]*)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+        rf'"\1":"{MASK_SECRET}"',
+        s
+    )
+    masked = re.sub(
+        r'(?i)"([^"]*(?:token|secret|password|passwd|pass|key|api[-_]?key|auth|bearer|credential|pat|private[-_]?key)[^"]*)"\s*:\s*([^,}\]\s]+)',
+        rf'"\1":{MASK_SECRET}',
+        masked
+    )
+    masked = re.sub(
+        r'(?i)"([^"]*(?:token|secret|password|passwd|pass|key|api[-_]?key|auth|bearer|credential|pat|private[-_]?key)[^"]*)"\s*:\s*("[^"]*)$',
+        rf'"\1":"{MASK_SECRET}"',
+        masked
+    )
+    tokens = re.findall(r'[A-Za-z0-9_-]+', s.lower())
+    if any(t in _SENSITIVE_WORDS_EXACT or _is_sensitive_param_name(t) for t in tokens):
+        return MASK_SECRET
+    return masked
+
+
+def redact_args(args: List[Any]) -> List[str]:
+    """Redacts command arguments while preserving argument list structure."""
+    if not isinstance(args, list):
+        return []
+    redacted = []
+    prev_is_flag = False
+    prev_user_flag: Optional[str] = None
+    prev_is_header = False
+    prev_is_env = False
+    json_accum: List[str] = []
+    json_flag_prefix: str = ""
+    for a in args:
+        a_str = str(a)
+        if json_accum:
+            json_accum.append(a_str)
+            if a_str.strip().endswith("}") or a_str.strip().endswith("]"):
+                blob = " ".join(json_accum)
+                pref = json_flag_prefix
+                json_accum = []
+                json_flag_prefix = ""
+                try:
+                    p = json.loads(blob)
+                    redacted.append(f"{pref}{json.dumps(redact_server_dict(p), separators=(',', ':'), ensure_ascii=False)}")
+                except Exception:
+                    redacted.append(f"{pref}{_mask_malformed_json(blob)}")
+            continue
+        if prev_user_flag is not None:
+            flag = prev_user_flag
+            if a_str in _STRUCTURAL_FLAGS or a_str.startswith("--"):
+                prev_user_flag = None
+                # Do NOT consume a_str as a value! Fall through!
+            elif a_str.startswith("-"):
+                prev_user_flag = None
+                # pass - do not consume flag as user value
+            elif ":" in a_str:
+                prev_user_flag = None
+                u, pw = a_str.split(":", 1)
+                redacted.append(_mask_userinfo(u, pw))
+                continue
+            elif flag in ("--user", "--proxy-user") or _is_token_shaped(a_str) or _TOKEN_SEARCH_RE.search(a_str):
+                prev_user_flag = None
+                redacted.append(MASK_SECRET)
+                continue
+            else:
+                prev_user_flag = None
+                redacted.append(a_str)
+                continue
+
+        if prev_is_flag:
+            if a_str in _STRUCTURAL_FLAGS or a_str.startswith("--"):
+                prev_is_flag = False
+                # Do NOT consume a_str as a value! Fall through!
+            else:
+                prev_is_flag = False
+                redacted.append(MASK_SECRET)
+                continue
+
+        if prev_is_header:
+            if a_str in _STRUCTURAL_FLAGS or a_str.startswith("--"):
+                prev_is_header = False
+                # Do NOT consume a_str as a value! Fall through!
+            else:
+                s_strip = a_str.strip()
+                if s_strip.startswith("{") or s_strip.startswith("["):
+                    prev_is_header = False
+                    try:
+                        p_json = json.loads(s_strip)
+                        r_json = redact_server_dict(p_json)
+                        redacted.append(json.dumps(r_json, separators=(',', ':'), ensure_ascii=False))
+                        continue
+                    except Exception:
+                        redacted.append(_mask_malformed_json(s_strip))
+                        continue
+                if s_strip.endswith(":") and not (s_strip.startswith("{") or s_strip.startswith("[")):
+                    redacted.append(a_str)
+                    prev_is_header = True
+                    continue
+                prev_is_header = False
+                if ":" in a_str or "=" in a_str:
+                    redacted.append(_redact_header_str(a_str))
+                else:
+                    redacted.append(MASK_SECRET)
+                continue
+
+        if prev_is_env:
+            if a_str in _STRUCTURAL_FLAGS or a_str.startswith("--"):
+                prev_is_env = False
+                # Do NOT consume a_str as a value! Fall through!
+            elif "=" in a_str:
+                prev_is_env = False
+                k, _ = a_str.split("=", 1)
+                redacted.append(f"{k}={MASK_SECRET}")
+                continue
+            else:
+                prev_is_env = False
+                redacted.append(redact_url_or_cmd(a_str))
+                continue
+
+        # Check attached -H or --header= (must execute BEFORE inline = check)
+        if (a_str.startswith("-H") and len(a_str) > 2 and not a_str.startswith("-H=")) or a_str.startswith(("-H=", "--header=", "-header=")):
+            if a_str.startswith("-H="):
+                prefix = "-H="
+                val = a_str[3:]
+            elif a_str.startswith("--header="):
+                prefix = "--header="
+                val = a_str[len("--header="):]
+            elif a_str.startswith("-header="):
+                prefix = "-header="
+                val = a_str[len("-header="):]
+            elif a_str.startswith(("-H ", "-H\t")):
+                prefix = a_str[:3]
+                val = a_str[3:].strip()
+            else:
+                prefix = "-H"
+                val = a_str[2:]
+
+            if val.startswith(('"', "'")):
+                q = val[0]
+                if len(val) >= 2 and val.endswith(q):
+                    val_body = val[1:-1]
+                    trail_q = q
+                else:
+                    val_body = val[1:]
+                    trail_q = ""
+            else:
+                q = ""
+                trail_q = ""
+                val_body = val
+
+            redacted.append(f"{prefix}{q}{_redact_header_str(val_body)}{trail_q}")
+            prev_is_flag = False
+            continue
+
+        # Check attached -u (must execute BEFORE inline = check)
+        if a_str.startswith("-u") and not a_str.startswith("-u=") and len(a_str) > 2:
+            if a_str.startswith(("-u ", "-u\t")):
+                prefix = a_str[:3]
+                val = a_str[3:].strip()
+            else:
+                prefix = "-u"
+                val = a_str[2:]
+
+            starts_with_q = val.startswith(('"', "'"))
+            has_colon = ":" in val
+            is_token = _is_token_shaped(val) or bool(_TOKEN_SEARCH_RE.search(val)) or (len(val) >= 20 and not val.startswith("-"))
+
+            if starts_with_q or has_colon or is_token:
+                if starts_with_q:
+                    q = val[0]
+                    if len(val) >= 2 and val.endswith(q):
+                        val_body = val[1:-1]
+                        trail_q = q
+                    else:
+                        val_body = val[1:]
+                        trail_q = ""
+                else:
+                    q = ""
+                    trail_q = ""
+                    val_body = val
+
+                if ":" in val_body:
+                    u_part, pw_part = val_body.split(":", 1)
+                    redacted.append(f"{prefix}{q}{_mask_userinfo(u_part, pw_part)}{trail_q}")
+                elif _is_token_shaped(val_body) or _TOKEN_SEARCH_RE.search(val_body) or len(val_body) >= 20:
+                    redacted.append(f"{prefix}{q}{MASK_SECRET}{trail_q}")
+                else:
+                    redacted.append(f"{prefix}{q}{MASK_SECRET}{trail_q}")
+                prev_is_flag = False
+                continue
+
+        # Check flag with = (e.g. -u=user:pass, --token=..., --password=..., --header=...)
+        # Inline "=" check: only split on "=" if _STANDALONE_FLAG_RE.fullmatch(flag)
+        if (a_str.startswith("--") or a_str.startswith("-")) and "=" in a_str:
+            flag, val = a_str.split("=", 1)
+            if _STANDALONE_FLAG_RE.fullmatch(flag) and "://" not in flag:
+                if flag in ("-u", "--user", "-U", "--proxy-user"):
+                    if ":" in val:
+                        u, pw = val.split(":", 1)
+                        redacted.append(f"{flag}={_mask_userinfo(u, pw)}")
+                    else:
+                        redacted.append(f"{flag}={MASK_SECRET}")
+                    prev_is_flag = False
+                    continue
+                if _is_sensitive_flag(flag):
+                    redacted.append(f"{flag}={MASK_SECRET}")
+                    prev_is_flag = False  # DO NOT treat next argument as value!
+                    continue
+                if flag in ("--header", "-H", "-header") or (flag.startswith("-") and (flag.endswith("header") or flag.endswith("headers"))):
+                    redacted.append(f"{flag}={_redact_header_str(val)}")
+                    prev_is_flag = False
+                    continue
+                if flag in ("-e", "--env", "-env"):
+                    if "=" in val:
+                        sub_k, _ = val.split("=", 1)
+                        redacted.append(f"{flag}={sub_k}={MASK_SECRET}")
+                    else:
+                        redacted.append(f"{flag}={val}")
+                    prev_is_flag = False
+                    continue
+                val_stripped = val.strip()
+                if (val_stripped.startswith("{") and not val_stripped.endswith("}")) or (val_stripped.startswith("[") and not val_stripped.endswith("]")):
+                    json_accum = [val]
+                    json_flag_prefix = f"{flag}="
+                    prev_is_flag = False
+                    continue
+                if val_stripped.startswith("{") or val_stripped.startswith("["):
+                    try:
+                        parsed_json = json.loads(val_stripped)
+                        redacted_json = redact_server_dict(parsed_json)
+                        redacted.append(f"{flag}={json.dumps(redacted_json, separators=(',', ':'), ensure_ascii=False)}")
+                        prev_is_flag = False
+                        continue
+                    except Exception:
+                        redacted.append(f"{flag}={_mask_malformed_json(val_stripped)}")
+                        prev_is_flag = False
+                        continue
+
+                if "://" in val:
+                    redacted.append(f"{flag}={_redact_single_url(val)}")
+                    prev_is_flag = False
+                    continue
+                if "=" in val:
+                    sub_k, sub_val = val.split("=", 1)
+                    if _is_sensitive_param_name(sub_k):
+                        redacted.append(f"{flag}={sub_k}={MASK_SECRET}")
+                        prev_is_flag = False
+                        continue
+                    else:
+                        redacted.append(f"{flag}={sub_k}={_redact_single_url(sub_val)}")
+                        prev_is_flag = False
+                        continue
+                if _is_token_shaped(val) or _TOKEN_SEARCH_RE.search(val):
+                    redacted.append(f"{flag}={MASK_SECRET}")
+                    prev_is_flag = False
+                    continue
+                redacted.append(f"{flag}={redact_secretish(val)}")
+                prev_is_flag = False
+                continue
+
+        if a_str in ("-u", "--user", "-U", "--proxy-user"):
+            redacted.append(a_str)
+            prev_user_flag = a_str
+            continue
+
+        if a_str == "-H" or (a_str.startswith("-") and (a_str.endswith("header") or a_str.endswith("headers"))):
+            redacted.append(a_str)
+            prev_is_header = True
+            continue
+
+        if a_str in ("-e", "--env", "-env"):
+            redacted.append(a_str)
+            prev_is_env = True
+            continue
+
+        # Only treat a token as standalone sensitive flag if it matches _STANDALONE_FLAG_RE
+        # Anything containing ':', whitespace, '/', '@', or quotes must NEVER set prev_is_flag = True!
+        if _STANDALONE_FLAG_RE.match(a_str) and _is_sensitive_flag(a_str):
+            redacted.append(a_str)
+            prev_is_flag = True
+            continue
+
+        # In generic fall-through, if re.match(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+:\s", a_str): route through _redact_header_str(a_str)
+        if re.match(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+:\s", a_str):
+            redacted.append(_redact_header_str(a_str))
+            continue
+
+        # Header argument without preceding -H
+        if a_str.lower().startswith("authorization:"):
+            redacted.append(_redact_header_str(a_str))
+            continue
+
+        # JSON blob argument (e.g. {"token": "SECRET"} or [{"key": "..."}])
+        stripped_a = a_str.strip()
+        if (stripped_a.startswith("{") and not stripped_a.endswith("}")) or (stripped_a.startswith("[") and not stripped_a.endswith("]")):
+            json_accum = [a_str]
+            json_flag_prefix = ""
+            continue
+        if stripped_a.startswith("{") or stripped_a.startswith("["):
+            try:
+                parsed_json = json.loads(stripped_a)
+                redacted_json = redact_server_dict(parsed_json)
+                redacted.append(json.dumps(redacted_json, separators=(',', ':'), ensure_ascii=False))
+                continue
+            except Exception:
+                redacted.append(_mask_malformed_json(a_str))
+                continue
+
+        # Check key=value assignment without leading -
+        if "=" in a_str and not a_str.startswith("-"):
+            k, val = a_str.split("=", 1)
+            if "://" not in k:
+                if _is_sensitive_param_name(k):
+                    redacted.append(f"{k}={MASK_SECRET}")
+                    continue
+                else:
+                    redacted.append(f"{k}={_redact_single_url(val)}")
+                    continue
+
+        # Check URL or general command string
+        if "://" in a_str:
+            redacted.append(redact_url_or_cmd(a_str))
+            continue
+
+        redacted.append(redact_url_or_cmd(a_str))
+
+    if json_accum:
+        blob = " ".join(json_accum)
+        pref = json_flag_prefix
+        try:
+            p = json.loads(blob)
+            redacted.append(f"{pref}{json.dumps(redact_server_dict(p), separators=(',', ':'), ensure_ascii=False)}")
+        except Exception:
+            redacted.append(f"{pref}{_mask_malformed_json(blob)}")
+
+    return [redact_secretish(x) for x in redacted]
+
+
+def redact_secretish(text: str, _recurse_url: bool = True) -> str:
+    """Masks token-shaped and secret-shaped CLI flags and key=value pairs in command strings."""
     if not isinstance(text, str):
         return text
-    flag_pattern = r"(?i)(--(?:(?:access[-_]?)?token|api[-_]?key|auth[-_]?token|secret|password|key))"
+    if _is_token_shaped(text.strip()):
+        return MASK_SECRET
+
+    # Mask -u "user:pass" or --user "user:pass" or -u 'user:pass' (quote-aware)
+    _QUOTED_USER_RE = re.compile(
+        r'''(?i)(^|\s)(-u|--user|-U|--proxy-user)(\s+|=)?(?:"((?:[^"\\]|\\.)*)"|'([^']*)')'''
+    )
+
+    def _sub_quoted_user(m):
+        pre, flag, sep = m.group(1), m.group(2), m.group(3) or ""
+        dq = m.group(4) is not None
+        body, q = (m.group(4), '"') if dq else (m.group(5), "'")
+        if ":" in body:
+            u, pw = body.split(":", 1)
+            masked = _mask_userinfo(u, pw)
+        elif flag.lower() in ("--user", "--proxy-user") or _is_token_shaped(body) or _TOKEN_SEARCH_RE.search(body):
+            masked = MASK_SECRET
+        else:
+            return m.group(0)
+        return f"{pre}{flag}{sep}{q}{masked}{q}"
+
+    text = _QUOTED_USER_RE.sub(_sub_quoted_user, text)
+
+    unclosed = _find_unclosed_quote(text)
+    if unclosed is not None:
+        idx, q = unclosed
+        head = text[:idx]
+        tail = text[idx + 1:]
+        m_u = re.search(r'(?i)(^|\s)(-u|--user|-U|--proxy-user)(\s+|=)?$', head)
+        if m_u:
+            pre, flag, sep = m_u.group(1), m_u.group(2), m_u.group(3) or ""
+            if ":" in tail:
+                u, pw = tail.split(":", 1)
+                masked = _mask_userinfo(u, pw)
+            else:
+                masked = MASK_SECRET
+            text = f"{head[:m_u.start()]}{pre}{flag}{sep}{q}{masked}"
+
+    # Mask unquoted -u user:pass or --user user:pass (allowing empty password with *)
+    def _sub_unquoted_user(m):
+        prefix, flag, sep, u, pw = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+        return f"{prefix}{flag}{sep}{_mask_userinfo(u, pw)}"
+
     text = re.sub(
-        flag_pattern + r"=(\"[^\"]*\"|\'[^\']*\'|[^\s]+)",
-        rf"\g<1>=••••••••",
+        r'(?i)(^|\s)(-u|--user|-U|--proxy-user)(\s+|=)([^\s:"\']+):([^\s"\'<>]*)',
+        _sub_unquoted_user,
+        text
+    )
+
+    # Mask attached unquoted -uuser:pass (allowing empty password with *)
+    def _sub_attached_unquoted_user(m):
+        prefix, u, pw = m.group(1), m.group(2), m.group(3)
+        return f"{prefix}-u{_mask_userinfo(u, pw)}"
+
+    text = re.sub(
+        r'(?i)(^|\s)-u([^\s:=][^\s:"\']*):([^\s"\'<>]*)',
+        _sub_attached_unquoted_user,
+        text
+    )
+
+    # Mask --user TOKEN (without colon)
+    text = re.sub(
+        r'(?i)(^|\s)(--user|--proxy-user)(\s+|=)(?!-)([^\s"\'<>:]+)(?=\s|$)',
+        rf"\g<1>\g<2>\g<3>{MASK_SECRET}",
+        text
+    )
+    # Mask -u=TOKEN
+    text = re.sub(
+        r'(?i)(^|\s)-u="?([^\s"\'<>:]+)"?(?=\s|$)',
+        rf'\g<1>-u={MASK_SECRET}',
+        text
+    )
+    # Mask -u TOKEN when token-shaped
+    token_pattern = (
+        r'(?:sk-[a-zA-Z0-9_-]{8,}'
+        r'|(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{15,}'
+        r'|xox[baprs]-[0-9a-zA-Z-]{20,}'
+        r'|bot[0-9]+:[a-zA-Z0-9_-]+'
+        r'|eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+'
+        r'|AKIA[0-9A-Z]{16}'
+        r'|[0-9a-zA-Z_-]{24,})'
+    )
+    text = re.sub(
+        rf'(?i)(^|\s)-u(\s+)("?{token_pattern}"?)(?=\s|$)',
+        rf'\g<1>-u\g<2>{MASK_SECRET}',
         text
     )
     text = re.sub(
-        flag_pattern + r"(\s+)(\"[^\"]*\"|\'[^\']*\'|(?!-)[^\s]+)",
-        rf"\g<1>\g<2>••••••••",
+        rf'(?i)(^|\s)-u({token_pattern})(?=\s|$)',
+        rf'\g<1>-u{MASK_SECRET}',
         text
     )
-    return text
+    def _sub_flag_arg(m):
+        pre, flag = m.group(1), m.group(2)
+        if m.group(3) is not None:
+            sep, val = m.group(3), m.group(4)
+        else:
+            sep, val = m.group(5), m.group(6)
+        if _is_sensitive_flag(flag):
+            q = val[0] if val.startswith(('"', "'")) and val.endswith(('"', "'")) and len(val) >= 2 else ""
+            return f"{pre}{flag}{sep}{q}{MASK_SECRET}{q}" if q else f"{pre}{flag}{sep}{MASK_SECRET}"
+        if val.startswith(('"', "'")) and val.endswith(('"', "'")) and len(val) >= 2:
+            q = val[0]
+            inner = val[1:-1]
+            return f"{pre}{flag}{sep}{q}{redact_secretish(inner)}{q}"
+        return m.group(0)
+
+    text = FLAG_ARG_RE.sub(_sub_flag_arg, text)
+
+    def _sub_header_flag(m):
+        pre = m.group(1)
+        flag = m.group(2)
+        if m.group(3) is not None:
+            sep = m.group(3)
+            q = m.group(4) or ""
+            val = m.group(5) if m.group(4) else (m.group(6) or m.group(7))
+            closing = q if (q and m.group(0).endswith(q)) else ""
+            return f"{pre}{flag}{sep}{q}{_redact_header_str(val)}{closing}"
+        elif m.group(8) is not None:
+            q = m.group(8)
+            val = m.group(9)
+            closing = q if m.group(0).endswith(q) else ""
+            return f"{pre}{flag}{q}{_redact_header_str(val)}{closing}"
+        else:
+            val = m.group(10)
+            return f"{pre}{flag}{_redact_header_str(val)}"
+
+    HEADER_FLAG_RE = re.compile(
+        r'(?i)(^|[\s"\'\(])(-H|--header|-header|--(?:[A-Za-z0-9_-]+-)?headers?)'
+        r'(?:'
+        r'(=|\s+)(?:(["\'])((?:[^\\]|\\.)*?)(?:\4|$)|([A-Za-z0-9!#$%&*+\-.^_`|~]+:\s*(?:[^"\'\n]*?(?=\s+--?[A-Za-z0-9]|["\'\)]|$)|[^\s"\'<>]*))|(\S+))'
+        r'|(["\'])((?:[^\\]|\\.)*?)(?:\8|$)'
+        r'|([A-Za-z0-9!#$%&*+\-.^_`|~]+:\s*(?:[^"\'\n]*?(?=\s+--?[A-Za-z0-9]|["\'\)]|$)|[^\s"\'<>]*))'
+        r')'
+    )
+    text = HEADER_FLAG_RE.sub(_sub_header_flag, text)
+    text = re.sub(r'(?i)\b(Bearer|Basic)\s+[^\s"\',;]+', rf'\1 {MASK_SECRET}', text)
+    text = re.sub(
+        r"(?i)\b(Authorization:\s*(?:Bearer|Basic|Token)\s+)[^\s\"']+",
+        rf"\g<1>{MASK_SECRET}",
+        text
+    )
+    text = re.sub(
+        r"(?i)\b([A-Za-z0-9_-]{0,128}(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|API[-_]?KEY|AUTH|BEARER|CREDENTIAL|PRIVATE[-_]?KEY|SIG|SIGNATURE|[-_]PASS|[-_]PAT)[A-Za-z0-9_-]{0,128})=([^\s\"';&]+|'[^']*'|\"[^\"]*\")",
+        rf"\g<1>={MASK_SECRET}",
+        text
+    )
+
+    def _sub_inline_json_blob(m):
+        blob = m.group(0)
+        try:
+            parsed = json.loads(blob)
+            return json.dumps(redact_server_dict(parsed), separators=(',', ':'), ensure_ascii=False)
+        except Exception:
+            return _mask_malformed_json(blob)
+
+    text = re.sub(r'\{[^{}\n]{2,}\}', _sub_inline_json_blob, text)
+    if _recurse_url:
+        return _TOKEN_SEARCH_RE.sub(MASK_SECRET, redact_url_or_cmd(text))
+    return _TOKEN_SEARCH_RE.sub(MASK_SECRET, text)
 
 
-def redact_server_dict(data: dict) -> dict:
-    """Creates a deep copy of server dictionary with secrets masked for display."""
-    d = json.loads(json.dumps(data))
-    if "oauth" in d and isinstance(d["oauth"], dict):
-        if d["oauth"].get("clientSecret"):
-            d["oauth"]["clientSecret"] = "●●●●●●●●"
-    if d.get("oauthClientSecret"):
-        d["oauthClientSecret"] = "●●●●●●●●"
-    if "env" in d and isinstance(d["env"], dict):
-        for k in d["env"]:
-            d["env"][k] = "●●●●●●●●"
-    if "headers" in d and isinstance(d["headers"], dict):
-        for k in d["headers"]:
-            if k.lower() not in _PUBLIC_HEADERS_ALLOWLIST:
-                d["headers"][k] = "●●●●●●●●"
-    if "serverUrl" in d and isinstance(d["serverUrl"], str):
-        d["serverUrl"] = redact_url_or_cmd(d["serverUrl"])
-    if "args" in d and isinstance(d["args"], list):
-        d["args"] = [redact_url_or_cmd(str(a)) for a in d["args"]]
-    return d
+def _format_masked_cmd_or_url(server: Union["McpServerModel", str]) -> str:
+    """Formats and masks command or URL for dashboard and CLI table display."""
+    if isinstance(server, str):
+        cmd = server.strip()
+        if not cmd:
+            return "<empty>"
+        try:
+            tokens = shlex.split(cmd)
+            if tokens:
+                redacted = redact_args(tokens)
+                return sanitize_display(redact_secretish(shlex.join(redacted)))
+        except (ValueError, Exception):
+            return sanitize_display(_mask_edit_buffer_args(cmd))
+        return sanitize_display(redact_secretish(cmd))
+
+    if server.transport == "stdio":
+        cmd_tokens = [server.command]
+        try:
+            split_cmd = shlex.split(server.command)
+            if len(split_cmd) > 1:
+                cmd_tokens = redact_args(split_cmd)
+        except Exception:
+            pass
+        parts = [" ".join(cmd_tokens)] + redact_args(server.args)
+        cmd_val = " ".join(p for p in parts if p).strip()
+    else:
+        cmd_val = _redact_single_url(server.server_url)
+    return sanitize_display(redact_secretish(cmd_val))
+
+
+def redact_server_dict(data: Any, parent_is_sensitive: bool = False) -> Any:
+    """Creates a deep copy of dictionary or structure with secrets masked for display/export."""
+    if isinstance(data, dict):
+        d = {}
+        for k, v in data.items():
+            k_str = str(k)
+            is_sens = parent_is_sensitive or (_is_sensitive_param_name(k_str) and k_str not in _ALLOWLISTED_KEYS)
+            if is_sens:
+                if isinstance(v, dict):
+                    d[k] = redact_server_dict(v, parent_is_sensitive=True)
+                elif isinstance(v, list):
+                    d[k] = redact_server_dict(v, parent_is_sensitive=True)
+                else:
+                    d[k] = MASK_SECRET
+            elif k_str == "env" and isinstance(v, dict):
+                d[k] = {ek: MASK_SECRET for ek in v}
+            elif "header" in k_str.lower() and isinstance(v, dict):
+                d[k] = {
+                    hk: (MASK_SECRET if (hk.lower() not in _PUBLIC_HEADERS_ALLOWLIST or _is_sensitive_param_name(hk)) else hv)
+                    for hk, hv in v.items()
+                }
+            elif "header" in k_str.lower() and isinstance(v, list):
+                d[k] = [_redact_header_str(x) if isinstance(x, str) else redact_server_dict(x, parent_is_sensitive=False) for x in v]
+            elif k_str in ("serverUrl", "url") and isinstance(v, str):
+                d[k] = _redact_single_url(v)
+            elif k_str == "args" and isinstance(v, list):
+                d[k] = redact_args(v)
+            elif k_str == "command" and isinstance(v, str):
+                d[k] = redact_secretish(v)
+            else:
+                d[k] = redact_server_dict(v, parent_is_sensitive=False)
+        return d
+    elif isinstance(data, list):
+        if parent_is_sensitive:
+            return [
+                redact_server_dict(x, parent_is_sensitive=True) if isinstance(x, (dict, list))
+                else MASK_SECRET
+                for x in data
+            ]
+        return [redact_server_dict(x, parent_is_sensitive=False) for x in data]
+    elif isinstance(data, str):
+        if parent_is_sensitive:
+            return MASK_SECRET
+        if _is_token_shaped(data.strip()):
+            return MASK_SECRET
+        if ":" in data and "://" not in data:
+            colon_idx = data.find(":")
+            hdr_name = data[:colon_idx].strip()
+            if _RFC9110_HEADER_NAME_RE.fullmatch(hdr_name) and (hdr_name.lower() in ("authorization", "proxy-authorization", "x-api-key") or _is_sensitive_param_name(hdr_name)):
+                return _redact_header_str(data)
+        return redact_secretish(data)
+    else:
+        if parent_is_sensitive:
+            return MASK_SECRET
+        return data
 
 
 
 # ==============================================================================
 # 1. Data Models
 # ==============================================================================
+
+_EDITABLE_FIELDS = (
+    "transport", "command", "args", "env", "server_url", "headers",
+    "auth_provider", "oauth_client_id", "oauth_client_secret",
+    "disabled", "timeout_seconds", "eager", "background",
+    "bypass_sandbox", "skip_tool_name_prefix"
+)
+_ALL_CLIENT_ID_KEYS = ("clientId", "client_id", "oauthClientId", "oauth_client_id")
+_ALL_CLIENT_SECRET_KEYS = ("clientSecret", "client_secret", "oauthClientSecret", "oauth_client_secret")
+_CLIENT_ID_KEYS = _ALL_CLIENT_ID_KEYS
+_CLIENT_SECRET_KEYS = _ALL_CLIENT_SECRET_KEYS
+
+
+def _strip_client_creds(container: Dict[str, Any]) -> None:
+    """Removes client ID and client secret keys from a dictionary."""
+    if not isinstance(container, dict):
+        return
+    for k in _ALL_CLIENT_ID_KEYS + _ALL_CLIENT_SECRET_KEYS:
+        container.pop(k, None)
+
+
+def _purge_credentials(res: Dict[str, Any]) -> None:
+    """
+    Purges client credentials from oauth, authConfig, and root,
+    preserving non-credential keys (like scopes, redirectUri).
+    Drops oauth/authConfig only if they become completely empty.
+    """
+    if not isinstance(res, dict):
+        return
+    _strip_client_creds(res)
+    if isinstance(res.get("oauth"), dict):
+        _strip_client_creds(res["oauth"])
+        if not res["oauth"]:
+            res.pop("oauth", None)
+    if isinstance(res.get("authConfig"), dict):
+        _strip_client_creds(res["authConfig"])
+        if not res["authConfig"]:
+            res.pop("authConfig", None)
+
 
 @dataclass
 class McpServerModel:
@@ -330,10 +1260,65 @@ class McpServerModel:
     extra: Dict[str, Any] = field(default_factory=dict)
     explicit_timeout: bool = False
     explicit_transport: bool = False
+    raw_dict: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    _snapshot: Dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    _orig_transport: Optional[str] = field(default=None, repr=False, compare=False)
+    _orig_command: Optional[str] = field(default=None, repr=False, compare=False)
+    _orig_args: Optional[List[str]] = field(default=None, repr=False, compare=False)
+    _orig_env: Optional[Dict[str, str]] = field(default=None, repr=False, compare=False)
+    _orig_server_url: Optional[str] = field(default=None, repr=False, compare=False)
+    _orig_headers: Optional[Dict[str, str]] = field(default=None, repr=False, compare=False)
+    _orig_auth_provider: Optional[str] = field(default=None, repr=False, compare=False)
+    _orig_oauth_client_id: Optional[str] = field(default=None, repr=False, compare=False)
+    _orig_oauth_client_secret: Optional[str] = field(default=None, repr=False, compare=False)
+    _orig_disabled: Optional[bool] = field(default=None, repr=False, compare=False)
+    _orig_timeout_seconds: Optional[int] = field(default=None, repr=False, compare=False)
+    _orig_eager: Optional[bool] = field(default=None, repr=False, compare=False)
+    _orig_background: Optional[str] = field(default=None, repr=False, compare=False)
+    _orig_bypass_sandbox: Optional[bool] = field(default=None, repr=False, compare=False)
+    _orig_skip_tool_name_prefix: Optional[bool] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if self.timeout_seconds != 60:
             self.explicit_timeout = True
+        if not self._snapshot:
+            self.take_snapshot()
+
+    @property
+    def timeout(self) -> int:
+        return self.timeout_seconds
+
+    @timeout.setter
+    def timeout(self, val: Any):
+        try:
+            self.timeout_seconds = int(val)
+        except (ValueError, TypeError):
+            self.timeout_seconds = 60
+
+    @property
+    def url(self) -> str:
+        return self.server_url
+
+    @url.setter
+    def url(self, val: Any):
+        self.server_url = str(val or "")
+
+    def take_snapshot(self):
+        self._snapshot = {
+            f: copy.deepcopy(getattr(self, f))
+            for f in _EDITABLE_FIELDS
+            if hasattr(self, f)
+        }
+        for f in _EDITABLE_FIELDS:
+            if hasattr(self, f):
+                setattr(self, f"_orig_{f}", copy.deepcopy(getattr(self, f)))
+
+    def has_changed(self, f: str) -> bool:
+        if not hasattr(self, f):
+            return False
+        if f not in self._snapshot:
+            return True
+        return getattr(self, f) != self._snapshot[f]
 
     @staticmethod
     def _str_list(v: Any) -> List[str]:
@@ -379,28 +1364,55 @@ class McpServerModel:
         else:
             transport = "http" if url else "stdio"
 
-        # Authentication provider
-        auth_provider = str(data.get("authProviderType", data.get("auth_provider", "none")) or "none")
+        # OAuth credentials: check oauth dict first, then authConfig dict, then root level
+        oauth_client_id = ""
+        if isinstance(data.get("oauth"), dict):
+            oauth_obj = data["oauth"]
+            for k in ("clientId", "client_id", "oauthClientId", "oauth_client_id"):
+                if oauth_obj.get(k):
+                    oauth_client_id = oauth_obj[k]
+                    break
+        if not oauth_client_id and isinstance(data.get("authConfig"), dict):
+            auth_cfg = data["authConfig"]
+            for k in ("clientId", "oauthClientId", "client_id", "oauth_client_id"):
+                if auth_cfg.get(k):
+                    oauth_client_id = auth_cfg[k]
+                    break
+        if not oauth_client_id:
+            for k in ("oauthClientId", "clientId", "client_id", "oauth_client_id"):
+                if data.get(k):
+                    oauth_client_id = data[k]
+                    break
 
-        # OAuth credentials: read both native nested oauth object and legacy flat keys (C3)
-        oauth_obj = data.get("oauth") if isinstance(data.get("oauth"), dict) else {}
-        auth_cfg = data.get("authConfig") if isinstance(data.get("authConfig"), dict) else {}
-        oauth_client_id = (
-            oauth_obj.get("clientId")
-            or oauth_obj.get("client_id")
-            or data.get("oauthClientId")
-            or data.get("oauth_client_id")
-            or auth_cfg.get("clientId")
-            or auth_cfg.get("oauthClientId", "")
-        )
-        oauth_client_secret = (
-            oauth_obj.get("clientSecret")
-            or oauth_obj.get("client_secret")
-            or data.get("oauthClientSecret")
-            or data.get("oauth_client_secret")
-            or auth_cfg.get("clientSecret")
-            or auth_cfg.get("oauthClientSecret", "")
-        )
+        oauth_client_secret = ""
+        if isinstance(data.get("oauth"), dict):
+            oauth_obj = data["oauth"]
+            for k in ("clientSecret", "client_secret", "oauthClientSecret", "oauth_client_secret"):
+                if oauth_obj.get(k):
+                    oauth_client_secret = oauth_obj[k]
+                    break
+        if not oauth_client_secret and isinstance(data.get("authConfig"), dict):
+            auth_cfg = data["authConfig"]
+            for k in ("clientSecret", "oauthClientSecret", "client_secret", "oauth_client_secret"):
+                if auth_cfg.get(k):
+                    oauth_client_secret = auth_cfg[k]
+                    break
+        if not oauth_client_secret:
+            for k in ("oauthClientSecret", "clientSecret", "client_secret", "oauth_client_secret"):
+                if data.get(k):
+                    oauth_client_secret = data[k]
+                    break
+
+        # Authentication provider: do NOT inject "oauth" simply because oauth or authConfig exists
+        raw_auth = None
+        for k in ("authProviderType", "auth_provider"):
+            if k in data and data[k] is not None and str(data[k]).strip():
+                raw_auth = data[k]
+                break
+        if raw_auth is not None and str(raw_auth).strip():
+            auth_provider = str(raw_auth).strip().lower()
+        else:
+            auth_provider = "none"
 
         # Tool configuration (lazy loading & background execution)
         tool_config = data.get("toolConfig") if isinstance(data.get("toolConfig"), dict) else {}
@@ -409,9 +1421,15 @@ class McpServerModel:
         if background not in ("OFF", "ALWAYS"):
             background = "OFF"
 
-        # Timeout handling without magic sentinel loss (M9)
+        # Timeout handling without magic sentinel loss (M9) - unified alias precedence
         explicit_timeout = any(k in data for k in ("timeoutSeconds", "timeout_seconds", "timeout"))
-        raw_timeout = data.get("timeoutSeconds", data.get("timeout_seconds", data.get("timeout", 60)))
+        raw_timeout = None
+        for k in ("timeoutSeconds", "timeout_seconds", "timeout"):
+            if k in data and data[k] is not None:
+                raw_timeout = data[k]
+                break
+        if raw_timeout is None:
+            raw_timeout = 60
         try:
             timeout_seconds = int(raw_timeout)
         except (ValueError, TypeError):
@@ -426,7 +1444,7 @@ class McpServerModel:
         env = cls._str_map(data.get("env"))
         headers = cls._header_map(data.get("headers"))
 
-        return cls(
+        model = cls(
             name=name,
             transport=transport,
             command=command,
@@ -446,16 +1464,17 @@ class McpServerModel:
             extra=extra,
             explicit_timeout=explicit_timeout,
             explicit_transport=explicit_transport,
+            raw_dict=copy.deepcopy(data),
         )
+        return model
 
-    def to_dict(self) -> dict:
+    def to_dict_full(self) -> dict:
         result: Dict[str, Any] = {}
         if self.disabled:
             result["disabled"] = True
 
-        if self.explicit_transport:
+        if self.explicit_transport or self.transport not in ("stdio", "http"):
             result["transport"] = self.transport
-
 
         if self.transport == "stdio":
             result["command"] = self.command
@@ -468,29 +1487,42 @@ class McpServerModel:
             if self.headers:
                 result["headers"] = dict(self.headers)
 
+        if self.explicit_timeout or self.timeout_seconds != 60 or self.has_changed("timeout_seconds"):
+            result["timeoutSeconds"] = self.timeout_seconds
+
+        extra_copy = copy.deepcopy(self.extra)
         if self.auth_provider == "google_credentials":
             result["authProviderType"] = "google_credentials"
+            _purge_credentials(extra_copy)
         elif self.auth_provider == "oauth":
             result["authProviderType"] = "oauth"
-            oauth_dict: Dict[str, str] = {}
+            _strip_client_creds(extra_copy)
+            oauth_dict: Dict[str, Any] = {}
+            if isinstance(extra_copy.get("oauth"), dict):
+                oauth_dict = copy.deepcopy(extra_copy["oauth"])
+                _strip_client_creds(oauth_dict)
             if self.oauth_client_id:
                 oauth_dict["clientId"] = self.oauth_client_id
             if self.oauth_client_secret:
                 oauth_dict["clientSecret"] = self.oauth_client_secret
             if oauth_dict:
                 result["oauth"] = oauth_dict
+            extra_copy.pop("oauth", None)
         elif self.auth_provider not in ("none", ""):
             result["authProviderType"] = self.auth_provider
+            _purge_credentials(extra_copy)
+        else:
+            _purge_credentials(extra_copy)
 
         # AGY Tooling & Context settings: only emit when eager or background != 'OFF' (M9)
-        tool_cfg: Dict[str, Any] = {}
+        tool_cfg_new: Dict[str, Any] = {}
         if self.eager:
-            tool_cfg["eager"] = True
+            tool_cfg_new["eager"] = True
         if self.background != "OFF":
-            tool_cfg["background"] = self.background
+            tool_cfg_new["background"] = self.background
 
-        if tool_cfg:
-            result["toolConfig"] = tool_cfg
+        if tool_cfg_new:
+            result["toolConfig"] = tool_cfg_new
 
         if self.bypass_sandbox:
             result["bypassSandbox"] = True
@@ -498,11 +1530,222 @@ class McpServerModel:
         if self.skip_tool_name_prefix:
             result["skipToolNamePrefix"] = True
 
-        if self.explicit_timeout or self.timeout_seconds != 60:
-            result["timeoutSeconds"] = self.timeout_seconds
-
         # Merge unmodeled keys first, allowing modeled keys to take precedence (C1)
-        return {**self.extra, **result}
+        return {**extra_copy, **result}
+
+    def to_dict(self, base_dict: Optional[Dict[str, Any]] = None) -> dict:
+        if self.raw_dict is None:
+            return self.to_dict_full()
+        source_dict = base_dict if base_dict is not None else self.raw_dict
+        if source_dict is None or not isinstance(source_dict, dict) or not source_dict:
+            return self.to_dict_full()
+
+        # Check if completely unedited using snapshot
+        is_unedited = not any(self.has_changed(f) for f in _EDITABLE_FIELDS)
+        if is_unedited:
+            return copy.deepcopy(source_dict)
+
+        res = copy.deepcopy(source_dict)
+        if self.raw_dict is not None or base_dict is not None:
+            if self.has_changed("disabled"):
+                if self.disabled:
+                    res["disabled"] = True
+                else:
+                    res.pop("disabled", None)
+
+            # Transport
+            if self.has_changed("transport"):
+                # User explicitly changed the transport
+                res["transport"] = self.transport
+                if self.transport == "stdio":
+                    # Remove HTTP keys only
+                    for k in ("serverUrl", "url", "headers"):
+                        res.pop(k, None)
+                    res["command"] = self.command
+                    res["args"] = list(self.args)
+                    if self.env:
+                        res["env"] = dict(self.env)
+                    else:
+                        res.pop("env", None)
+                elif self.transport == "http":
+                    # Remove stdio keys only
+                    for k in ("command", "args", "env"):
+                        res.pop(k, None)
+                    res["serverUrl"] = self.server_url
+                    res.pop("url", None)
+                    if self.headers:
+                        res["headers"] = dict(self.headers)
+                    else:
+                        res.pop("headers", None)
+            else:
+                # Transport unchanged: only update fields that actually changed
+                if self.transport == "stdio":
+                    if self.has_changed("command"):
+                        res["command"] = self.command
+                    if self.has_changed("args"):
+                        res["args"] = list(self.args)
+                    if self.has_changed("env"):
+                        if self.env:
+                            res["env"] = dict(self.env)
+                        else:
+                            res.pop("env", None)
+                else:
+                    if self.has_changed("server_url"):
+                        if "url" in res and "serverUrl" not in res:
+                            res["url"] = self.server_url
+                        else:
+                            res["serverUrl"] = self.server_url
+                            res.pop("url", None)
+                    if self.has_changed("headers"):
+                        if self.headers:
+                            res["headers"] = dict(self.headers)
+                        else:
+                            res.pop("headers", None)
+
+            # Timeout handling: write canonical timeoutSeconds and remove legacy aliases
+            if self.has_changed("timeout_seconds"):
+                res["timeoutSeconds"] = int(self.timeout_seconds)
+                res.pop("timeout", None)
+                res.pop("timeout_seconds", None)
+
+            # Auth handling:
+            # Invariant: An alias is removed only in the same step its value is written to the canonical key,
+            # or when the field is being deliberately cleared.
+            auth_provider_changed = self.has_changed("auth_provider")
+            cred_changed = (
+                self.has_changed("oauth_client_id")
+                or self.has_changed("oauth_client_secret")
+            )
+            switching_away = auth_provider_changed and self.auth_provider in ("none", "google_credentials")
+
+            if auth_provider_changed:
+                if self.auth_provider == "oauth":
+                    res["authProviderType"] = "oauth"
+                    res.pop("auth_provider", None)
+                elif self.auth_provider in ("none", "google_credentials"):
+                    if self.auth_provider == "google_credentials":
+                        res["authProviderType"] = "google_credentials"
+                    else:
+                        res.pop("authProviderType", None)
+                    res.pop("auth_provider", None)
+                else:
+                    res["authProviderType"] = self.auth_provider
+                    res.pop("auth_provider", None)
+            elif cred_changed and self.auth_provider == "oauth":
+                res["authProviderType"] = "oauth"
+                res.pop("auth_provider", None)
+
+            if not switching_away and (cred_changed or (auth_provider_changed and self.auth_provider == "oauth")):
+                if self.has_changed("oauth_client_id"):
+                    if self.oauth_client_id:
+                        if not isinstance(res.get("oauth"), dict):
+                            res["oauth"] = {}
+                        res["oauth"]["clientId"] = self.oauth_client_id
+                        for ak in _ALL_CLIENT_ID_KEYS:
+                            if ak != "clientId":
+                                res["oauth"].pop(ak, None)
+                        if isinstance(res.get("authConfig"), dict):
+                            res["authConfig"]["clientId"] = self.oauth_client_id
+                            for ak in _ALL_CLIENT_ID_KEYS:
+                                if ak != "clientId":
+                                    res["authConfig"].pop(ak, None)
+                        for ak in _ALL_CLIENT_ID_KEYS:
+                            res.pop(ak, None)
+                    else:
+                        if isinstance(res.get("oauth"), dict):
+                            for ak in _ALL_CLIENT_ID_KEYS:
+                                res["oauth"].pop(ak, None)
+                        if isinstance(res.get("authConfig"), dict):
+                            for ak in _ALL_CLIENT_ID_KEYS:
+                                res["authConfig"].pop(ak, None)
+                        for ak in _ALL_CLIENT_ID_KEYS:
+                            res.pop(ak, None)
+
+                if self.has_changed("oauth_client_secret"):
+                    if self.oauth_client_secret:
+                        if not isinstance(res.get("oauth"), dict):
+                            res["oauth"] = {}
+                        res["oauth"]["clientSecret"] = self.oauth_client_secret
+                        for ak in _ALL_CLIENT_SECRET_KEYS:
+                            if ak != "clientSecret":
+                                res["oauth"].pop(ak, None)
+                        if isinstance(res.get("authConfig"), dict):
+                            res["authConfig"]["clientSecret"] = self.oauth_client_secret
+                            for ak in _ALL_CLIENT_SECRET_KEYS:
+                                if ak != "clientSecret":
+                                    res["authConfig"].pop(ak, None)
+                        for ak in _ALL_CLIENT_SECRET_KEYS:
+                            res.pop(ak, None)
+                    else:
+                        if isinstance(res.get("oauth"), dict):
+                            for ak in _ALL_CLIENT_SECRET_KEYS:
+                                res["oauth"].pop(ak, None)
+                        if isinstance(res.get("authConfig"), dict):
+                            for ak in _ALL_CLIENT_SECRET_KEYS:
+                                res["authConfig"].pop(ak, None)
+                        for ak in _ALL_CLIENT_SECRET_KEYS:
+                            res.pop(ak, None)
+
+                if isinstance(res.get("oauth"), dict) and not res["oauth"]:
+                    res.pop("oauth", None)
+                if isinstance(res.get("authConfig"), dict) and not res["authConfig"]:
+                    res.pop("authConfig", None)
+
+            if switching_away:
+                _purge_credentials(res)
+
+
+            # ToolConfig: independent merge of eager and background
+            if self.has_changed("eager") or self.has_changed("background"):
+                tool_cfg = res.get("toolConfig")
+                if not isinstance(tool_cfg, dict):
+                    need_cfg = (self.has_changed("eager") and self.eager) or (self.has_changed("background") and self.background != "OFF")
+                    tool_cfg = {} if need_cfg else None
+                else:
+                    tool_cfg = copy.deepcopy(tool_cfg)
+
+                if tool_cfg is not None:
+                    if self.has_changed("eager"):
+                        if self.eager:
+                            tool_cfg["eager"] = True
+                        elif "eager" in tool_cfg:
+                            tool_cfg["eager"] = False
+                    if self.has_changed("background"):
+                        if self.background != "OFF":
+                            tool_cfg["background"] = self.background
+                        elif "background" in tool_cfg:
+                            tool_cfg["background"] = "OFF"
+
+                    if tool_cfg:
+                        res["toolConfig"] = tool_cfg
+                    else:
+                        res.pop("toolConfig", None)
+
+                if self.has_changed("eager"):
+                    res.pop("eager", None)
+                if self.has_changed("background"):
+                    res.pop("background", None)
+
+            # Sandbox & Prefix
+            if self.has_changed("bypass_sandbox"):
+                if self.bypass_sandbox:
+                    res["bypassSandbox"] = True
+                    res.pop("bypass_sandbox", None)
+                else:
+                    res.pop("bypassSandbox", None)
+                    res.pop("bypass_sandbox", None)
+
+            if self.has_changed("skip_tool_name_prefix"):
+                if self.skip_tool_name_prefix:
+                    res["skipToolNamePrefix"] = True
+                    res.pop("skip_tool_name_prefix", None)
+                else:
+                    res.pop("skipToolNamePrefix", None)
+                    res.pop("skip_tool_name_prefix", None)
+
+            return res
+
+        return self.to_dict_full()
 
 
 @dataclass
@@ -666,23 +1909,28 @@ class ConfigManager:
     """
     def __init__(self, config_path: str = DEFAULT_CONFIG_PATH):
         expanded = os.path.expanduser(config_path)
-        # Symlink resolution to protect dotfile repos (M2)
-        if os.path.islink(expanded) or os.path.exists(expanded):
-            self.config_path = os.path.realpath(expanded)
-        else:
-            self.config_path = os.path.abspath(expanded)
+        self.config_path = os.path.abspath(expanded)
         self.backup_path = self.config_path + ".bak"
-        self.lock_path = os.path.join(os.path.dirname(self.config_path), ".mcp_config.lock")
+        self.lock_path = self._compute_lock_path()
         self._lock_depth = 0
         self._lock_fd = None
 
+    def _compute_lock_path(self) -> str:
+        real_cfg = os.path.realpath(self.config_path)
+        real_dir = os.path.dirname(real_cfg)
+        self.lock_path = os.path.join(real_dir, f".{os.path.basename(real_cfg)}.lock")
+        return self.lock_path
+
     @contextmanager
-    def _config_lock(self):
+    def _config_lock(self, real_cfg: Optional[str] = None):
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
         if self._lock_depth == 0:
-            parent_dir = os.path.dirname(self.config_path)
-            if parent_dir:
-                os.makedirs(parent_dir, mode=0o700, exist_ok=True)
+            if real_cfg is None:
+                real_cfg = os.path.realpath(self.config_path)
+            real_dir = os.path.dirname(real_cfg)
+            self.lock_path = os.path.join(real_dir, f".{os.path.basename(real_cfg)}.lock")
+            if real_dir and not os.path.exists(real_dir):
+                os.makedirs(real_dir, mode=0o700, exist_ok=True)
             self._lock_fd = os.open(self.lock_path, flags, 0o600)
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
         self._lock_depth += 1
@@ -697,16 +1945,19 @@ class ConfigManager:
                     os.close(self._lock_fd)
                     self._lock_fd = None
 
-    def load_raw_json(self) -> Dict[str, Any]:
+    def load_raw_json(self, path: Optional[str] = None) -> Dict[str, Any]:
         """Loads raw JSON config dict, refusing to swallow syntax errors (C2)."""
-        if not os.path.exists(self.config_path):
+        cfg_p = path if path is not None else self.config_path
+        if not os.path.exists(cfg_p):
             return {"mcpServers": {}}
 
         try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
+            with open(cfg_p, "r", encoding="utf-8-sig") as f:
                 content = f.read()
         except OSError as e:
-            raise ConfigParseError(f"Cannot read config file: {e}", path=self.config_path)
+            raise ConfigParseError(f"Cannot read config file: {e}", path=cfg_p)
+        except (UnicodeDecodeError, ValueError) as e:
+            raise ConfigParseError(f"Encoding error reading config file: {e}", path=cfg_p)
 
         if not content.strip():
             return {"mcpServers": {}}
@@ -714,10 +1965,10 @@ class ConfigManager:
         try:
             data = json.loads(content)
         except json.JSONDecodeError as e:
-            raise ConfigParseError(f"Malformed JSON: {e.msg}", path=self.config_path, lineno=e.lineno, colno=e.colno)
+            raise ConfigParseError(f"Malformed JSON: {e.msg}", path=cfg_p, lineno=e.lineno, colno=e.colno)
 
         if not isinstance(data, dict):
-            raise ConfigParseError(f"Root of config file must be a JSON object, got {type(data).__name__}", path=self.config_path)
+            raise ConfigParseError(f"Root of config file must be a JSON object, got {type(data).__name__}", path=cfg_p)
 
         return data
 
@@ -738,44 +1989,168 @@ class ConfigManager:
                 raise ConfigParseError(f"Failed to parse server '{name}': {e}", path=self.config_path)
         return models
 
-    def save_config(self, servers: Dict[str, McpServerModel]) -> None:
-        """Atomically saves server configurations with timestamped backup and safe permissions (C8, M1)."""
-        with self._config_lock():
-            parent_dir = os.path.dirname(self.config_path)
-            os.makedirs(parent_dir, mode=0o700, exist_ok=True)
+    @staticmethod
+    def _get_backup_dir() -> str:
+        env_dir = os.environ.get("AGY_MCP_BACKUP_DIR")
+        if env_dir:
+            backup_dir = os.path.abspath(os.path.expanduser(env_dir))
+        elif os.environ.get("XDG_STATE_HOME"):
+            backup_dir = os.path.abspath(os.path.join(os.environ["XDG_STATE_HOME"], "agy", "mcp-backups"))
+        else:
+            backup_dir = os.path.abspath(os.path.expanduser("~/.local/state/agy/mcp-backups"))
+
+        if not os.path.lexists(backup_dir):
+            os.makedirs(backup_dir, mode=0o700, exist_ok=True)
             try:
-                cur_st = os.stat(parent_dir)
-                cur_mode = stat.S_IMODE(cur_st.st_mode)
-                if (cur_mode & 0o077) != 0:
-                    os.chmod(parent_dir, cur_mode & 0o700)
+                os.chmod(backup_dir, 0o700)
             except OSError:
                 pass
 
-            # Ensure existing file is parseable before overwriting (C2)
-            raw = self.load_raw_json()
-            raw["mcpServers"] = {name: model.to_dict() for name, model in sorted(servers.items())}
+        st = os.lstat(backup_dir)
+        if stat.S_ISLNK(st.st_mode):
+            raise OSError(f"Insecure backup directory: '{backup_dir}' cannot be a symlink")
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"Insecure backup directory: '{backup_dir}' is not a directory")
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            raise OSError(f"Insecure backup directory: '{backup_dir}' is not owned by current user (UID {os.getuid()})")
+        if (st.st_mode & 0o077) != 0:
+            try:
+                os.chmod(backup_dir, 0o700)
+            except OSError as e:
+                raise OSError(f"Insecure backup directory: '{backup_dir}' has insecure permissions {oct(st.st_mode)} and chmod 0700 failed: {e}")
+            st = os.lstat(backup_dir)
+            if (st.st_mode & 0o077) != 0:
+                raise OSError(f"Insecure backup directory: '{backup_dir}' has insecure permissions {oct(st.st_mode)}")
 
-            # Multi-version timestamped backup with rolling retention of 5 (M1)
-            if os.path.exists(self.config_path):
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return backup_dir
+
+    def _write_raw_atomic(self, raw: Dict[str, Any], target_path: Optional[str] = None) -> None:
+        """Atomically persists raw dict with backups in isolated directory without symlink following into dotfiles."""
+        if target_path is None:
+            target_path = os.path.realpath(self.config_path)
+        real_cfg = target_path
+        target_parent = os.path.dirname(real_cfg)
+        if target_parent and not os.path.exists(target_parent):
+            os.makedirs(target_parent, mode=0o700, exist_ok=True)
+
+        logical_parent = os.path.dirname(self.config_path)
+        beside_config_opt_in = os.environ.get("AGY_MCP_BACKUP_BESIDE_CONFIG", "").strip() in ("1", "true", "yes")
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        cfg_hash = hashlib.sha256(real_cfg.encode("utf-8")).hexdigest()[:16]
+        base_name = os.path.basename(self.config_path)
+
+        if os.path.exists(target_path):
+            if beside_config_opt_in:
+                backup_dir = logical_parent if logical_parent else "."
+                if backup_dir and not os.path.exists(backup_dir):
+                    os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+                backup_path = self.config_path + ".bak"
                 ts_backup_path = f"{self.config_path}.bak.{ts}"
-                try:
-                    shutil.copy2(self.config_path, ts_backup_path)
-                    os.chmod(ts_backup_path, 0o600)
-                    # Keep latest pointer backup
-                    shutil.copy2(self.config_path, self.backup_path)
-                    os.chmod(self.backup_path, 0o600)
-                except Exception as e:
-                    raise OSError(f"Backup to {ts_backup_path} failed: {e}. Aborting save to protect configuration.")
+                prune_prefix = base_name + ".bak."
+            else:
+                backup_dir = self._get_backup_dir()
+                backup_path = os.path.join(backup_dir, f"{base_name}.{cfg_hash}.bak")
+                ts_backup_path = f"{backup_path}.{ts}"
+                prune_prefix = f"{base_name}.{cfg_hash}.bak."
+            self.backup_path = backup_path
+        else:
+            backup_dir = None
+            backup_path = None
+            ts_backup_path = None
+            prune_prefix = None
+            self.backup_path = None
 
-                # Prune older timestamped backups
+        # Step 1: Create, write and fsync main temp file first
+        fd, tmp_path = tempfile.mkstemp(dir=target_parent, prefix=".mcp_config.", suffix=".tmp")
+        try:
+            target_mode = 0o600
+            if os.path.exists(target_path):
                 try:
-                    base_name = os.path.basename(self.config_path)
-                    prefix = base_name + ".bak."
+                    cur_mode = stat.S_IMODE(os.stat(target_path).st_mode)
+                    target_mode = cur_mode & 0o600
+                except OSError:
+                    pass
+            try:
+                os.fchmod(fd, target_mode)
+            except OSError:
+                pass
+
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Step 2: Write backups if target exists
+            if os.path.exists(target_path):
+                try:
+                    with open(target_path, "rb") as f_in:
+                        orig_bytes = f_in.read()
+
+                    bak_matches = False
+                    if os.path.exists(backup_path):
+                        try:
+                            fd_read = os.open(backup_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                            try:
+                                with os.fdopen(fd_read, "rb") as fb_exist:
+                                    bak_matches = (fb_exist.read() == orig_bytes)
+                            except Exception:
+                                pass
+                        except OSError:
+                            pass
+
+                    if not bak_matches or not os.path.exists(backup_path):
+                        # Safe atomic write to backup_path
+                        fd_b, tmp_bak = tempfile.mkstemp(dir=backup_dir, prefix=".mcp_bak.", suffix=".tmp")
+                        try:
+                            os.fchmod(fd_b, 0o600)
+                            with os.fdopen(fd_b, "wb") as fb:
+                                fb.write(orig_bytes)
+                                fb.flush()
+                                os.fsync(fb.fileno())
+                            os.replace(tmp_bak, backup_path)
+                        finally:
+                            if os.path.exists(tmp_bak):
+                                try:
+                                    os.remove(tmp_bak)
+                                except OSError:
+                                    pass
+
+                        # Safe atomic write to timestamped backup
+                        fd_ts, tmp_ts = tempfile.mkstemp(dir=backup_dir, prefix=".mcp_bak_ts.", suffix=".tmp")
+                        try:
+                            os.fchmod(fd_ts, 0o600)
+                            with os.fdopen(fd_ts, "wb") as ft:
+                                ft.write(orig_bytes)
+                                ft.flush()
+                                os.fsync(ft.fileno())
+                            os.replace(tmp_ts, ts_backup_path)
+                        finally:
+                            if os.path.exists(tmp_ts):
+                                try:
+                                    os.remove(tmp_ts)
+                                except OSError:
+                                    pass
+
+                    if backup_dir != target_parent:
+                        try:
+                            dirfd_bak = os.open(backup_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                            try:
+                                os.fsync(dirfd_bak)
+                            finally:
+                                os.close(dirfd_bak)
+                        except (OSError, AttributeError):
+                            pass
+                except Exception as e:
+                    raise OSError(f"Backup failed: {e}. Aborting save to protect configuration.")
+
+                # Prune older timestamped backups (keep latest 5)
+                try:
                     bak_files = [
-                        os.path.join(parent_dir, f)
-                        for f in os.listdir(parent_dir)
-                        if f.startswith(prefix)
+                        os.path.join(backup_dir, f)
+                        for f in os.listdir(backup_dir)
+                        if f.startswith(prune_prefix)
                     ]
                     bak_files.sort()
                     if len(bak_files) > 5:
@@ -787,84 +2162,135 @@ class ConfigManager:
                 except OSError:
                     pass
 
-            # Write to temporary file with 0o600 permissions (C8)
-            fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=".mcp_config.", suffix=".tmp")
+            # Step 3: Atomic replace of target config
+            os.replace(tmp_path, target_path)
+
+            # Step 4: fsync target directory
             try:
-                target_mode = 0o600
-                if os.path.exists(self.config_path):
-                    try:
-                        cur_mode = stat.S_IMODE(os.stat(self.config_path).st_mode)
-                        target_mode = cur_mode & 0o600
-                    except OSError:
-                        pass
+                dirfd = os.open(target_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
                 try:
-                    os.fchmod(fd, target_mode)
+                    os.fsync(dirfd)
+                finally:
+                    os.close(dirfd)
+            except (OSError, AttributeError):
+                pass
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
                 except OSError:
                     pass
 
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(raw, f, indent=2)
-                    f.write("\n")
-                    f.flush()
-                    os.fsync(f.fileno())
+    def transact(self, mutator: Callable[[Dict[str, Any]], Any]) -> Any:
+        """Executes mutator under exclusive lock, loading raw JSON and saving atomically (C1)."""
+        real_cfg = os.path.realpath(self.config_path)
+        with self._config_lock(real_cfg):
+            raw = self.load_raw_json(real_cfg)
+            if "mcpServers" in raw:
+                if raw["mcpServers"] is None:
+                    raw["mcpServers"] = {}
+                elif not isinstance(raw["mcpServers"], dict):
+                    raise ConfigParseError(
+                        f"'mcpServers' must be a JSON object, not {type(raw['mcpServers']).__name__}",
+                        path=self.config_path
+                    )
+            else:
+                raw["mcpServers"] = {}
+            raw_before_snap = json.dumps(raw, sort_keys=True, ensure_ascii=False)
+            res = mutator(raw)
+            raw_after_snap = json.dumps(raw, sort_keys=True, ensure_ascii=False)
+            if res is not False and raw_before_snap != raw_after_snap:
+                self._write_raw_atomic(raw, target_path=real_cfg)
+            return res
 
-                os.replace(tmp_path, self.config_path)
-
-                # Flush parent directory metadata
-                try:
-                    dirfd = os.open(parent_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                    try:
-                        os.fsync(dirfd)
-                    finally:
-                        os.close(dirfd)
-                except (OSError, AttributeError):
-                    pass
-            finally:
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
+    def save_config(self, servers: Dict[str, McpServerModel]) -> None:
+        """Atomically saves server configurations (C8, M1)."""
+        def mutator(raw: dict):
+            current_servers = raw.setdefault("mcpServers", {})
+            for name in list(current_servers.keys()):
+                if name not in servers:
+                    del current_servers[name]
+            for name, model in servers.items():
+                fresh_entry = current_servers.get(name)
+                base_dict = fresh_entry if isinstance(fresh_entry, dict) else None
+                persisted = model.to_dict(base_dict=base_dict)
+                current_servers[name] = persisted
+                model.raw_dict = copy.deepcopy(persisted)
+                model._snapshot = copy.deepcopy(model.raw_dict)
+                model.take_snapshot()
+        self.transact(mutator)
 
     def get_server(self, name: str) -> Optional[McpServerModel]:
         return self.load_config().get(name)
 
-    def set_server(self, server: McpServerModel) -> None:
-        with self._config_lock():
-            servers = self.load_config()
-            servers[server.name] = server
-            self.save_config(servers)
+    def set_server(self, server: McpServerModel, overwrite: bool = False, is_new: Optional[bool] = None) -> None:
+        def mutator(raw: dict):
+            servers = raw.setdefault("mcpServers", {})
+            actual_is_new = (server.raw_dict is None) if is_new is None else is_new
+            if actual_is_new:
+                if server.name in servers and not overwrite:
+                    raise ValueError(f"Server '{server.name}' already exists.")
+                base_dict = {}
+            else:
+                if server.name not in servers:
+                    base_dict = {}
+                else:
+                    fresh_entry = servers[server.name]
+                    base_dict = fresh_entry if isinstance(fresh_entry, dict) else {}
+            persisted = server.to_dict(base_dict=base_dict)
+            servers[server.name] = persisted
+            server.raw_dict = copy.deepcopy(persisted)
+            server._snapshot = copy.deepcopy(server.raw_dict)
+            server.take_snapshot()
+        self.transact(mutator)
+
+    def rename_server(self, old_name: str, server: McpServerModel, overwrite: bool = False) -> None:
+        """Atomically renames a server in a single transaction (H2)."""
+        def mutator(raw: dict):
+            servers = raw.setdefault("mcpServers", {})
+            if old_name not in servers:
+                raise KeyError(f"Server '{old_name}' not found.")
+            if server.name != old_name and server.name in servers and not overwrite:
+                raise ValueError(f"Server '{server.name}' already exists.")
+            old_entry = servers.pop(old_name)
+            fresh_entry = old_entry if isinstance(old_entry, dict) else None
+            persisted = server.to_dict(base_dict=fresh_entry)
+            servers[server.name] = persisted
+            server.raw_dict = copy.deepcopy(persisted)
+            server._snapshot = copy.deepcopy(server.raw_dict)
+            server.take_snapshot()
+        self.transact(mutator)
 
     def remove_server(self, name: str) -> bool:
-        with self._config_lock():
-            servers = self.load_config()
+        def mutator(raw: dict) -> bool:
+            servers = raw.setdefault("mcpServers", {})
             if name in servers:
                 del servers[name]
-                self.save_config(servers)
                 return True
             return False
+        return bool(self.transact(mutator))
 
     def enable_server(self, name: str) -> bool:
-        with self._config_lock():
-            servers = self.load_config()
+        def mutator(raw: dict) -> bool:
+            servers = raw.setdefault("mcpServers", {})
             if name in servers:
-                if not servers[name].disabled:
-                    return True  # No-op if already enabled
-                servers[name].disabled = False
-                self.save_config(servers)
-                return True
+                entry = servers[name]
+                if isinstance(entry, dict):
+                    entry.pop("disabled", None)
+                    return True
             return False
+        return bool(self.transact(mutator))
 
     def disable_server(self, name: str) -> bool:
-        with self._config_lock():
-            servers = self.load_config()
+        def mutator(raw: dict) -> bool:
+            servers = raw.setdefault("mcpServers", {})
             if name in servers:
-                if servers[name].disabled:
-                    return True  # No-op if already disabled
-                servers[name].disabled = True
-                self.save_config(servers)
-                return True
+                entry = servers[name]
+                if isinstance(entry, dict):
+                    entry["disabled"] = True
+                    return True
             return False
+        return bool(self.transact(mutator))
 
 
 
@@ -953,7 +2379,7 @@ class ToolSchemaReader:
             except Exception:
                 continue
 
-        return sorted(tools, key=lambda t: t.name)
+        return sorted(tools, key=lambda t: str(t.name))
 
     def get_tool_count(self, server_name: str) -> int:
         return len(self.get_tools(server_name))
@@ -983,55 +2409,11 @@ class PreflightChecker:
 
         # 2. Transport & Command / URL
         if server.transport == "stdio":
-            if not server.command or not server.command.strip():
-                diags.append(Diagnostic("ERROR", "Executable command is required for stdio transport.", field="command"))
-            else:
-                cmd = server.command.strip()
-                # Whitespace in command is a common pitfall (M18)
-                if any(c.isspace() for c in cmd):
-                    diags.append(Diagnostic("ERROR", f"Command '{cmd}' contains whitespace. Put arguments into the Command Arguments field instead.", field="command"))
-                else:
-                    resolved = shutil.which(cmd)
-                    if resolved:
-                        diags.append(Diagnostic("PASS", f"Executable found in PATH: {resolved}", field="command"))
-                    else:
-                        diags.append(Diagnostic("WARNING", f"Command '{cmd}' not found in current $PATH. Ensure it is installed before running AGY.", field="command"))
-
-            if server.args:
-                safe_args = redact_secretish(" ".join(shlex.quote(redact_url_or_cmd(a)) for a in server.args))
-                diags.append(Diagnostic("INFO", f"Arguments ({len(server.args)} items): {safe_args}", field="args"))
-                for arg in server.args:
-                    if "<your-" in arg or "TOKEN_HERE" in arg.upper() or "<workspace-root>" in arg:
-                        diags.append(Diagnostic("WARNING", f"Argument '{arg}' contains an unconfigured placeholder value.", field="args"))
-
-            for k, v in server.env.items():
-                if not k.strip():
-                    diags.append(Diagnostic("ERROR", "Environment variable name cannot be empty.", field="env"))
-                elif not re.fullmatch(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
-                    diags.append(Diagnostic("ERROR", f"Environment variable name '{k}' is invalid. Must match '^[A-Za-z_][A-Za-z0-9_]*$'.", field="env"))
-                elif not v:
-                    diags.append(Diagnostic("WARNING", f"Environment variable '{k}' has an empty value.", field="env"))
-                elif "<your-" in v or "TOKEN_HERE" in v.upper():
-                    diags.append(Diagnostic("WARNING", f"Environment variable '{k}' contains an unconfigured placeholder value.", field="env"))
-
+            PreflightChecker._check_command(server, diags)
         elif server.transport == "http":
             if server.command or server.args or server.env:
                 diags.append(Diagnostic("WARNING", "HTTP transport is active, but stdio fields (command, args, or env) are populated and will be ignored.", field="transport"))
-            if not server.server_url or not server.server_url.strip():
-                diags.append(Diagnostic("ERROR", "Server URL is required for HTTP transport.", field="server_url"))
-            else:
-                raw_url = server.server_url.strip()
-                parsed = urllib.parse.urlparse(raw_url)
-                if parsed.scheme not in ("http", "https"):
-                    diags.append(Diagnostic("ERROR", "Server URL scheme must be http:// or https://.", field="server_url"))
-                elif not parsed.netloc:
-                    diags.append(Diagnostic("ERROR", "Server URL host / domain is missing or invalid.", field="server_url"))
-                else:
-                    # Cleartext warning on credentials (M18)
-                    if parsed.scheme == "http" and (server.auth_provider == "oauth" or any("AUTH" in h.upper() for h in server.headers)):
-                        diags.append(Diagnostic("WARNING", "Cleartext HTTP transport transmits credentials unencrypted. Use HTTPS.", field="server_url"))
-                    else:
-                        diags.append(Diagnostic("PASS", f"Valid {parsed.scheme.upper()} endpoint: {parsed.netloc}", field="server_url"))
+            PreflightChecker._check_http_url(server, diags)
 
             for k, v in server.headers.items():
                 if not k.strip():
@@ -1093,6 +2475,84 @@ class PreflightChecker:
                 pass
 
         return diags
+
+    @staticmethod
+    def _check_command(server: McpServerModel, diags: List[Diagnostic]):
+        if not server.command or not server.command.strip():
+            diags.append(Diagnostic("ERROR", "Executable command is required for stdio transport.", field="command"))
+        else:
+            cmd = server.command.strip()
+            try:
+                masked_cmd = redact_secretish(" ".join(redact_args(shlex.split(cmd))))
+            except Exception:
+                masked_cmd = MASK_SECRET
+            # Whitespace in command is a common pitfall (M18)
+            if any(c.isspace() for c in cmd):
+                diags.append(Diagnostic("ERROR", f"Command '{masked_cmd}' contains whitespace. Put arguments into the Command Arguments field instead.", field="command"))
+            else:
+                resolved = shutil.which(cmd)
+                if resolved:
+                    diags.append(Diagnostic("PASS", f"Executable found in PATH: {resolved}", field="command"))
+                else:
+                    diags.append(Diagnostic("WARNING", f"Command '{masked_cmd}' not found in current $PATH. Ensure it is installed before running AGY.", field="command"))
+
+        if server.args:
+            redacted_args = redact_args(server.args)
+            safe_args = " ".join(shlex.quote(a) for a in redacted_args)
+            diags.append(Diagnostic("INFO", f"Arguments ({len(server.args)} items): {safe_args}", field="args"))
+            for raw_arg, red_arg in zip(server.args, redacted_args):
+                raw_str = str(raw_arg)
+                if "<your-" in raw_str or "TOKEN_HERE" in raw_str.upper() or "<workspace-root>" in raw_str:
+                    diags.append(Diagnostic("WARNING", f"Argument '{red_arg}' contains an unconfigured placeholder value.", field="args"))
+
+        for k, v in server.env.items():
+            if not k.strip():
+                diags.append(Diagnostic("ERROR", "Environment variable name cannot be empty.", field="env"))
+            elif not re.fullmatch(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+                diags.append(Diagnostic("ERROR", f"Environment variable name '{k}' is invalid. Must match '^[A-Za-z_][A-Za-z0-9_]*$'.", field="env"))
+            elif not v:
+                diags.append(Diagnostic("WARNING", f"Environment variable '{k}' has an empty value.", field="env"))
+            elif "<your-" in v or "TOKEN_HERE" in v.upper():
+                diags.append(Diagnostic("WARNING", f"Environment variable '{k}' contains an unconfigured placeholder value.", field="env"))
+
+    @staticmethod
+    def _check_http_url(server: McpServerModel, diags: List[Diagnostic]):
+        if not server.server_url or not server.server_url.strip():
+            diags.append(Diagnostic("ERROR", "Server URL is required for HTTP transport.", field="server_url"))
+            return
+        raw_url = server.server_url.strip()
+        try:
+            parsed = urllib.parse.urlparse(raw_url)
+        except Exception:
+            diags.append(Diagnostic("ERROR", "Invalid URL syntax or invalid characters in URL authority.", field="server_url"))
+            return
+
+        if parsed.scheme not in ("http", "https"):
+            diags.append(Diagnostic("ERROR", "Server URL scheme must be http:// or https://.", field="server_url"))
+            return
+        if not parsed.hostname:
+            diags.append(Diagnostic("ERROR", "Server URL host / domain is missing or invalid.", field="server_url"))
+            return
+
+        port = None
+        port_error = False
+        try:
+            port = parsed.port
+            if port is not None and not (0 <= port <= 65535):
+                port_error = True
+                diags.append(Diagnostic("ERROR", "Invalid port in URL.", field="server_url"))
+        except ValueError:
+            port_error = True
+            diags.append(Diagnostic("ERROR", "Invalid port in URL.", field="server_url"))
+
+        if not port_error:
+            # Cleartext warning on credentials (M18)
+            if parsed.scheme == "http" and (server.auth_provider == "oauth" or any("AUTH" in h.upper() for h in server.headers)):
+                diags.append(Diagnostic("WARNING", "Cleartext HTTP transport transmits credentials unencrypted. Use HTTPS.", field="server_url"))
+            else:
+                host = f"[{parsed.hostname}]" if ":" in (parsed.hostname or "") else parsed.hostname
+                host_port = f"{host}:{port}" if port else host
+                diags.append(Diagnostic("PASS", f"Valid {parsed.scheme.upper()} endpoint: {host_port}", field="server_url"))
 
     @staticmethod
     def has_errors(diagnostics: List[Diagnostic]) -> bool:
@@ -1264,9 +2724,27 @@ class InputReader:
 
 
 
-# ==============================================================================
-# 7. Interactive TUI Application (McpManagerApp)
-# ==============================================================================
+def _mask_edit_buffer_args(edit_buffer: str) -> str:
+    """
+    Safely redacts edit buffer in FormView args edit mode via synthetic close and reuse.
+    """
+    if not isinstance(edit_buffer, str) or not edit_buffer:
+        return edit_buffer
+
+    num_trailing_bs = len(edit_buffer) - len(edit_buffer.rstrip("\\"))
+    dangling_escape = (num_trailing_bs % 2 == 1)
+    buf_for_quotes = edit_buffer[:-1] if dangling_escape else edit_buffer
+    unclosed = _find_unclosed_quote(buf_for_quotes)
+    q = unclosed[1] if unclosed else None
+    candidate = buf_for_quotes + (q or "")
+
+    try:
+        tokens = shlex.split(candidate)
+        redacted = redact_args(tokens)
+        return shlex.join(redacted)
+    except Exception:
+        return MASK_SECRET
+
 
 class McpManagerApp:
     def __init__(self, config_manager: Optional[ConfigManager] = None):
@@ -1419,11 +2897,17 @@ class McpManagerApp:
             if total > 0 and self.dash_selected_idx < total:
                 name = self.server_keys[self.dash_selected_idx]
                 srv = self.servers[name]
-                srv.disabled = not srv.disabled
-                self.config_mgr.set_server(srv)
-                self.load_data()
-                state_str = "Disabled" if srv.disabled else "Enabled"
-                self.set_status(f"Server '{name}' {state_str.lower()}.")
+                try:
+                    if srv.disabled:
+                        self.config_mgr.enable_server(name)
+                    else:
+                        self.config_mgr.disable_server(name)
+                    self.load_data()
+                    new_srv = self.servers.get(name)
+                    state_str = "Disabled" if (new_srv and new_srv.disabled) else "Enabled"
+                    self.set_status(f"Server '{name}' {state_str.lower()}.")
+                except (ConfigParseError, OSError, ValueError) as e:
+                    self.set_status(f"Error updating server '{name}': {e}", is_error=True)
         elif key in ("e", "E", "ENTER"):
             if total > 0 and self.dash_selected_idx < total:
                 name = self.server_keys[self.dash_selected_idx]
@@ -1435,6 +2919,7 @@ class McpManagerApp:
                 self.form_field_idx = 0
                 self.editing_field = False
                 self.form_dirty = False
+                self.mask_secrets = True
                 self.table_row_idx = 0
                 self.table_col_idx = 0
                 self.view = "form"
@@ -1446,6 +2931,7 @@ class McpManagerApp:
             self.form_field_idx = 0
             self.editing_field = False
             self.form_dirty = False
+            self.mask_secrets = True
             self.table_row_idx = 0
             self.table_col_idx = 0
             self.view = "form"
@@ -1524,11 +3010,7 @@ class McpManagerApp:
                 st_pill = f"{c.GREEN}{c.BOLD}[●] ON {c.RESET}" if not srv.disabled else f"{c.GRAY}[○] OFF{c.RESET}"
                 tr_pill = f"{c.MAGENTA}stdio{c.RESET}" if srv.transport == "stdio" else f"{c.BLUE}http {c.RESET}"
 
-                if srv.transport == "stdio":
-                    cmd_val = f"{srv.command} {' '.join(srv.args)}".strip()
-                else:
-                    cmd_val = srv.server_url
-                cmd_val = sanitize_display(redact_secretish(redact_url_or_cmd(cmd_val)))  # Redact credentials & flags
+                cmd_val = _format_masked_cmd_or_url(srv)
 
                 t_count = self.cached_tool_counts.get(name, 0)
                 t_str = f"{t_count:>2} tools" if t_count > 0 else f"{c.DIM} 0 tools{c.RESET}"
@@ -1734,8 +3216,12 @@ class McpManagerApp:
             self.table_col_idx = min(2, self.table_col_idx + 1)
         elif key in ("ENTER", "SPACE"):
             if self.table_row_idx == total_rows:
-                # Add item
-                new_key = f"VAR_{len(target_dict) + 1}" if is_stdio else f"Header-{len(target_dict) + 1}"
+                # Add item with unique key (M5)
+                prefix = "VAR_" if is_stdio else "Header-"
+                idx = 1
+                while f"{prefix}{idx}" in target_dict or (not is_stdio and any(k.lower() == f"{prefix}{idx}".lower() for k in target_dict)):
+                    idx += 1
+                new_key = f"{prefix}{idx}"
                 target_dict[new_key] = "value"
                 self.table_col_idx = 0
                 self.form_dirty = True
@@ -1843,7 +3329,19 @@ class McpManagerApp:
                 old_key = keys_list[self.table_row_idx]
                 if self.table_col_idx == 0:
                     if val and val != old_key:
-                        target_dict[val] = target_dict.pop(old_key)
+                        other_keys = [k for k in target_dict if k != old_key]
+                        if val in other_keys or (not is_stdio and any(k.lower() == val.lower() for k in other_keys)):
+                            self.set_status(f"Key '{val}' already exists.", is_error=True)
+                        else:
+                            new_dict = {}
+                            for k, v in target_dict.items():
+                                if k == old_key:
+                                    new_dict[val] = v
+                                else:
+                                    new_dict[k] = v
+                            target_dict.clear()
+                            target_dict.update(new_dict)
+                            self.form_dirty = True
                 elif self.table_col_idx == 1:
                     target_dict[old_key] = self.edit_buffer
 
@@ -1871,19 +3369,20 @@ class McpManagerApp:
 
         self._execute_save()
 
-    def _execute_save(self):
+    def _execute_save(self, overwrite: bool = False):
         srv = self.form_server
         try:
-            # If renamed, remove original server key first (C4)
+            # If renamed, use single atomic rename transaction (H2)
             if self.form_original_name and self.form_original_name != srv.name:
-                self.config_mgr.remove_server(self.form_original_name)
-
-            self.config_mgr.set_server(srv)
+                self.config_mgr.rename_server(self.form_original_name, srv, overwrite=overwrite)
+            else:
+                is_new = (self.form_original_name is None)
+                self.config_mgr.set_server(srv, overwrite=overwrite, is_new=is_new)
             self.load_data()
             self.form_dirty = False
             self.view = "dashboard"
             self.set_status(f"Server '{srv.name}' saved successfully.")
-        except Exception as e:
+        except (ConfigParseError, OSError, ValueError, KeyError, Exception) as e:
             self.set_status(f"Error saving server: {e}", is_error=True)
 
     def render_form(self, width: int, height: int) -> List[str]:
@@ -1949,7 +3448,6 @@ class McpManagerApp:
             dirty_indicator = f" {c.YELLOW}[Modified]{c.RESET}" if self.form_dirty else ""
             st_line = f" {c.DIM}Preflight validation ensures safe persistence.{c.RESET}{dirty_indicator}"
         lines.append(truncate_visible(st_line, width))
-
         return lines
 
     def _render_tab1(self, srv: McpServerModel, width: int) -> List[str]:
@@ -1961,7 +3459,14 @@ class McpManagerApp:
             is_sel = (self.form_field_idx == idx)
             prefix = f"{c.CYAN}{c.BOLD}❯ " if is_sel else "  "
             if is_sel and self.editing_field:
-                val_rendered = f"{c.BG_WHITE}{c.BLACK}{self.edit_buffer}█{c.RESET}"
+                if self.mask_secrets and (idx in (2, 3) if is_stdio else idx == 2):
+                    if is_stdio:
+                        disp_buf = _mask_edit_buffer_args(self.edit_buffer)
+                    else:
+                        disp_buf = _redact_single_url(self.edit_buffer)
+                    val_rendered = f"{c.BG_WHITE}{c.BLACK}{disp_buf}█{c.RESET}"
+                else:
+                    val_rendered = f"{c.BG_WHITE}{c.BLACK}{self.edit_buffer}█{c.RESET}"
             elif is_sel:
                 val_rendered = f"{c.INVERT} {val_disp} {c.RESET}"
             else:
@@ -1979,16 +3484,20 @@ class McpManagerApp:
         if is_stdio:
             cmd_resolved = shutil.which(srv.command) if srv.command else None
             path_badge = f"{c.GREEN}[✓ In PATH]{c.RESET}" if cmd_resolved else f"{c.YELLOW}[✗ Not in $PATH]{c.RESET}"
-            out.append(item(2, "Executable Command", sanitize_display(srv.command) or "<empty>", path_badge))
+            if self.mask_secrets and srv.command:
+                cmd_disp = _format_masked_cmd_or_url(srv.command)
+            else:
+                cmd_disp = sanitize_display(srv.command) or "<empty>"
+            out.append(item(2, "Executable Command", cmd_disp, path_badge))
 
-            args_str = sanitize_display(redact_secretish(" ".join(shlex.quote(redact_url_or_cmd(a)) for a in srv.args))) if srv.args else "<none>"
+            args_str = sanitize_display(" ".join(shlex.quote(a) for a in redact_args(srv.args))) if srv.args else "<none>"
             out.append(item(3, "Command Arguments", args_str, f"Parsed: {len(srv.args)} args"))
             out.append(item(4, "Timeout (Seconds)", str(srv.timeout_seconds), "Default: 60s"))
             out.append(item(5, "Bypass Sandbox", "[x] YES" if srv.bypass_sandbox else "[ ] NO", "Run outside sandbox"))
             out.append(item(6, "Skip Name Prefix", "[x] YES" if srv.skip_tool_name_prefix else "[ ] NO", "Direct tool names"))
             out.append(item(7, "Server State", "[x] DISABLED" if srv.disabled else "[ ] ENABLED", "Toggle active state"))
         else:
-            safe_url = sanitize_display(redact_url_or_cmd(srv.server_url)) if srv.server_url else "<empty>"
+            safe_url = sanitize_display(_redact_single_url(srv.server_url)) if srv.server_url else "<empty>"
             out.append(item(2, "Server URL", safe_url, "HTTP / HTTPS endpoint"))
             out.append(item(3, "Timeout (Seconds)", str(srv.timeout_seconds), "Default: 60s"))
             out.append(item(4, "Bypass Sandbox", "[x] YES" if srv.bypass_sandbox else "[ ] NO", "Run outside sandbox"))
@@ -2045,7 +3554,11 @@ class McpManagerApp:
                     k_str = f"{c.BOLD}{disp_k}{c.RESET}"
 
                 if v_sel and self.editing_field:
-                    v_str = f"{c.BG_WHITE}{c.BLACK}{self.edit_buffer}█{c.RESET}"
+                    if self.mask_secrets and (is_stdio or k.lower() not in _PUBLIC_HEADERS_ALLOWLIST or _is_sensitive_param_name(k)):
+                        disp_buf = "●" * len(self.edit_buffer) if self.edit_buffer else ""
+                        v_str = f"{c.BG_WHITE}{c.BLACK}{disp_buf}█{c.RESET}"
+                    else:
+                        v_str = f"{c.BG_WHITE}{c.BLACK}{self.edit_buffer}█{c.RESET}"
                 elif v_sel:
                     v_str = f"{c.INVERT} {disp_v} {c.RESET}"
                 else:
@@ -2094,7 +3607,11 @@ class McpManagerApp:
             is_sel_2 = (self.form_field_idx == 2)
             masked_sec = "●●●●●●●●" if (self.mask_secrets and srv.oauth_client_secret) else (unmasked_sec or "<empty>")
             if is_sel_2 and self.editing_field:
-                sec_disp = f"{c.BG_WHITE}{c.BLACK}{self.edit_buffer}█{c.RESET}"
+                if self.mask_secrets:
+                    disp_buf = "●" * len(self.edit_buffer) if self.edit_buffer else ""
+                    sec_disp = f"{c.BG_WHITE}{c.BLACK}{disp_buf}█{c.RESET}"
+                else:
+                    sec_disp = f"{c.BG_WHITE}{c.BLACK}{self.edit_buffer}█{c.RESET}"
             elif is_sel_2:
                 sec_disp = f"{c.INVERT} {masked_sec} {c.RESET}"
             else:
@@ -2200,6 +3717,7 @@ class McpManagerApp:
             self.form_field_idx = 0
             self.editing_field = False
             self.form_dirty = True
+            self.mask_secrets = True
             self.table_row_idx = 0
             self.table_col_idx = 0
             self.view = "form"
@@ -2301,10 +3819,14 @@ class McpManagerApp:
     # --------------------------------------------------------------------------
     def handle_delete_key(self, key: str):
         if key in ("y", "Y"):
-            self.config_mgr.remove_server(self.delete_target)
-            self.load_data()
-            self.view = "dashboard"
-            self.set_status(f"Server '{self.delete_target}' removed.")
+            try:
+                self.config_mgr.remove_server(self.delete_target)
+                self.load_data()
+                self.view = "dashboard"
+                self.set_status(f"Server '{self.delete_target}' removed.")
+            except (ConfigParseError, OSError, ValueError) as e:
+                self.view = "dashboard"
+                self.set_status(f"Error removing server '{self.delete_target}': {e}", is_error=True)
         elif key in ("n", "N", "ESCAPE", "q", "Q"):
             self.view = "dashboard"
             self.set_status("Deletion canceled.")
@@ -2319,7 +3841,7 @@ class McpManagerApp:
 
     def handle_overwrite_key(self, key: str):
         if key in ("y", "Y"):
-            self._execute_save()
+            self._execute_save(overwrite=True)
         elif key in ("n", "N", "ESCAPE"):
             self.view = "form"
             self.set_status("Save canceled. Please rename the server to avoid collision.", is_error=True)
@@ -2471,8 +3993,11 @@ def run_cli_list(config_mgr: ConfigManager, as_json: bool = False, show_secrets:
         else:
             auth_disp = f"{c.DIM}none{c.RESET}"
 
-        target = f"{srv.command} {' '.join(srv.args)}".strip() if srv.transport == "stdio" else srv.server_url
-        target = sanitize_display(redact_secretish(redact_url_or_cmd(target)))
+        if not show_secrets:
+            target = _format_masked_cmd_or_url(srv)
+        else:
+            raw_target = f"{srv.command} {' '.join(srv.args)}".strip() if srv.transport == "stdio" else srv.server_url
+            target = sanitize_display(raw_target)
         safe_name = sanitize_display(name)
 
         row = (
@@ -2484,6 +4009,79 @@ def run_cli_list(config_mgr: ConfigManager, as_json: bool = False, show_secrets:
             f"{target}"
         )
         print(row)
+    sys.exit(0)
+
+
+def _servers_or_raise(raw: Dict[str, Any], path: str = "") -> Dict[str, Any]:
+    """Ensures mcpServers exists and is a dictionary, raising ConfigParseError otherwise."""
+    if not isinstance(raw, dict):
+        raise ConfigParseError(f"Root of configuration must be a JSON object, got {type(raw).__name__}", path=path)
+    servers = raw.get("mcpServers")
+    if servers is None:
+        return {}
+    if not isinstance(servers, dict):
+        raise ConfigParseError(f"'mcpServers' must be a JSON dictionary, got {type(servers).__name__}", path=path)
+    return servers
+
+
+def run_cli_enable(config_mgr: ConfigManager, name: str, dry_run: bool = False, show_secrets: bool = False) -> None:
+    raw = config_mgr.load_raw_json()
+    servers = _servers_or_raise(raw, path=config_mgr.config_path)
+    if name not in servers:
+        sys.stderr.write(f"Error: Server '{name}' not found in configuration.\n")
+        sys.exit(1)
+    if dry_run:
+        entry = copy.deepcopy(servers[name])
+        if isinstance(entry, dict):
+            entry.pop("disabled", None)
+        payload = entry if show_secrets else redact_server_dict(entry)
+        print(f"[Dry Run] Would enable server '{name}':")
+        print(json.dumps({name: payload}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+    success = config_mgr.enable_server(name)
+    if not success:
+        sys.stderr.write(f"Error: Failed to enable server '{name}'. Server not found or invalid.\n")
+        sys.exit(1)
+    print(f"✓ Enabled MCP server '{name}'.")
+    sys.exit(0)
+
+
+def run_cli_disable(config_mgr: ConfigManager, name: str, dry_run: bool = False, show_secrets: bool = False) -> None:
+    raw = config_mgr.load_raw_json()
+    servers = _servers_or_raise(raw, path=config_mgr.config_path)
+    if name not in servers:
+        sys.stderr.write(f"Error: Server '{name}' not found in configuration.\n")
+        sys.exit(1)
+    if dry_run:
+        entry = copy.deepcopy(servers[name])
+        if isinstance(entry, dict):
+            entry["disabled"] = True
+        payload = entry if show_secrets else redact_server_dict(entry)
+        print(f"[Dry Run] Would disable server '{name}':")
+        print(json.dumps({name: payload}, indent=2, ensure_ascii=False))
+        sys.exit(0)
+    success = config_mgr.disable_server(name)
+    if not success:
+        sys.stderr.write(f"Error: Failed to disable server '{name}'. Server not found or invalid.\n")
+        sys.exit(1)
+    print(f"✓ Disabled MCP server '{name}'.")
+    sys.exit(0)
+
+
+def run_cli_remove(config_mgr: ConfigManager, name: str, dry_run: bool = False) -> None:
+    raw = config_mgr.load_raw_json()
+    servers = _servers_or_raise(raw, path=config_mgr.config_path)
+    if name not in servers:
+        sys.stderr.write(f"Error: Server '{name}' not found in configuration.\n")
+        sys.exit(1)
+    if dry_run:
+        print(f"[Dry Run] Would remove server '{name}' from configuration.")
+        sys.exit(0)
+    success = config_mgr.remove_server(name)
+    if not success:
+        sys.stderr.write(f"Error: Failed to remove server '{name}'. Server not found.\n")
+        sys.exit(1)
+    print(f"✓ Removed MCP server '{name}'. Backup saved to {config_mgr.backup_path}.")
     sys.exit(0)
 
 
@@ -2547,73 +4145,57 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    # CLI flag validation (H5, L1)
+    mutation_flags = [f for f, v in [("--enable", args.enable), ("--disable", args.disable), ("--remove", args.remove)] if v]
+    if args.dry_run and not mutation_flags:
+        parser.error("--dry-run requires a mutation action flag (-e/--enable, -d/--disable, or -r/--remove).")
+
+    op_flags = [f for f, v in [("--list", args.list), ("--enable", args.enable), ("--disable", args.disable), ("--remove", args.remove)] if v]
+    if len(op_flags) > 1:
+        parser.error(f"Cannot specify multiple operations simultaneously: {', '.join(op_flags)}")
+
+    if (args.json or args.show_secrets) and not mutation_flags:
+        args.list = True
+
+    if args.json and not args.list:
+        parser.error("--json can only be used with --list.")
+
+    if args.show_secrets and not (args.list or (args.dry_run and mutation_flags)):
+        parser.error("--show-secrets requires --list or mutation --dry-run.")
+
     config_mgr = ConfigManager(args.config)
 
     # Interactive TUI mode (when no operation flags specified and both stdin/stdout are TTY)
     is_interactive = not (args.list or args.enable or args.disable or args.remove)
-    if is_interactive:
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            app = McpManagerApp(config_mgr)
-            app.run()
-            sys.exit(0)
-        else:
-            # Piped or non-interactive stdout: fallback to list
-            run_cli_list(config_mgr, as_json=args.json, show_secrets=args.show_secrets)
-            sys.exit(0)
-
-    if args.list:
-        run_cli_list(config_mgr, as_json=args.json, show_secrets=args.show_secrets)
-
     try:
-        if args.enable:
-            name = args.enable
-            srv = config_mgr.get_server(name)
-            if not srv:
-                sys.stderr.write(f"Error: Server '{name}' not found in configuration.\n")
-                sys.exit(1)
-            if args.dry_run:
-                srv.disabled = False
-                payload = srv.to_dict() if args.show_secrets else redact_server_dict(srv.to_dict())
-                print(f"[Dry Run] Would enable server '{name}':")
-                print(json.dumps({name: payload}, indent=2, ensure_ascii=False))
+        if is_interactive:
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                app = McpManagerApp(config_mgr)
+                app.run()
                 sys.exit(0)
-            config_mgr.enable_server(name)
-            print(f"✓ Enabled MCP server '{name}'.")
-            sys.exit(0)
+            else:
+                # Piped or non-interactive stdout: fallback to list
+                run_cli_list(config_mgr, as_json=args.json, show_secrets=args.show_secrets)
+                sys.exit(0)
+
+        if args.list:
+            run_cli_list(config_mgr, as_json=args.json, show_secrets=args.show_secrets)
+
+        if args.enable:
+            run_cli_enable(config_mgr, args.enable, dry_run=args.dry_run, show_secrets=args.show_secrets)
 
         if args.disable:
-            name = args.disable
-            srv = config_mgr.get_server(name)
-            if not srv:
-                sys.stderr.write(f"Error: Server '{name}' not found in configuration.\n")
-                sys.exit(1)
-            if args.dry_run:
-                srv.disabled = True
-                payload = srv.to_dict() if args.show_secrets else redact_server_dict(srv.to_dict())
-                print(f"[Dry Run] Would disable server '{name}':")
-                print(json.dumps({name: payload}, indent=2, ensure_ascii=False))
-                sys.exit(0)
-            config_mgr.disable_server(name)
-            print(f"✓ Disabled MCP server '{name}'.")
-            sys.exit(0)
+            run_cli_disable(config_mgr, args.disable, dry_run=args.dry_run, show_secrets=args.show_secrets)
 
         if args.remove:
-            name = args.remove
-            srv = config_mgr.get_server(name)
-            if not srv:
-                sys.stderr.write(f"Error: Server '{name}' not found in configuration.\n")
-                sys.exit(1)
-            if args.dry_run:
-                print(f"[Dry Run] Would remove server '{name}' from configuration.")
-                sys.exit(0)
-            config_mgr.remove_server(name)
-            print(f"✓ Removed MCP server '{name}'. Backup saved to {config_mgr.backup_path}.")
-            sys.exit(0)
-
+            run_cli_remove(config_mgr, args.remove, dry_run=args.dry_run)
 
     except ConfigParseError as e:
         sys.stderr.write(f"Error: {e}\n")
         sys.exit(2)
+    except OSError as e:
+        sys.stderr.write(f"Error: {e}\n")
+        sys.exit(1)
     except Exception as e:
         sys.stderr.write(f"Error: {e}\n")
         sys.exit(1)

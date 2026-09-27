@@ -24,6 +24,7 @@ fi
 ENABLE_GIT=true
 ENABLE_TIMER=true
 ENABLE_QUOTA=true
+SUPPRESS_PENDING=false
 TIMER_FLAG=""
 QUOTA_FLAG=""
 TARGET_DIR=""
@@ -31,14 +32,14 @@ TARGET_DIR=""
 for arg in "$@"; do
     case "$arg" in
         --digital)
-            TIMER_FLAG="--digital"
+            TIMER_FLAG="${TIMER_FLAG:+$TIMER_FLAG }--digital"
             ;;
         --verbose)
-            TIMER_FLAG="--verbose"
-            QUOTA_FLAG="--verbose"
+            TIMER_FLAG="${TIMER_FLAG:+$TIMER_FLAG }--verbose"
+            QUOTA_FLAG="${QUOTA_FLAG:+$QUOTA_FLAG }--verbose"
             ;;
         --compact)
-            QUOTA_FLAG="--compact"
+            QUOTA_FLAG="${QUOTA_FLAG:+$QUOTA_FLAG }--compact"
             ;;
         --no-git)
             ENABLE_GIT=false
@@ -51,6 +52,10 @@ for arg in "$@"; do
             ;;
         --timer)
             ENABLE_TIMER=true
+            ;;
+        --suppress-pending)
+            SUPPRESS_PENDING=true
+            TIMER_FLAG="${TIMER_FLAG:+$TIMER_FLAG }--suppress-pending"
             ;;
         --no-quota)
             ENABLE_QUOTA=false
@@ -68,14 +73,14 @@ done
 
 # --- Target Directory Fallback & stdin check ---
 [ -z "$TARGET_DIR" ] && TARGET_DIR="$PWD"
-if [ -n "$INPUT_JSON" ]; then
+if [[ "$INPUT_JSON" =~ [^[:space:]] ]]; then
     CWD_FROM_JSON=$(echo "$INPUT_JSON" | jq -r '.cwd // empty' 2>/dev/null)
     [ -n "$CWD_FROM_JSON" ] && [ -d "$CWD_FROM_JSON" ] && TARGET_DIR="$CWD_FROM_JSON"
 fi
 
 # --- Detect True Terminal Width ---
 WIDTH=""
-if [ -n "$INPUT_JSON" ]; then
+if [[ "$INPUT_JSON" =~ [^[:space:]] ]]; then
     WIDTH=$(echo "$INPUT_JSON" | jq -r '.terminal.width // .columns // empty' 2>/dev/null)
 fi
 [ -z "$WIDTH" ] && [ -n "$STATUS_BAR_WIDTH" ] && WIDTH="$STATUS_BAR_WIDTH"
@@ -94,18 +99,38 @@ fi
 GIT_CONTENT=""
 GIT_RAW=""
 if [ "$ENABLE_GIT" = true ] && [ -x "$SCRIPT_DIR/git_status_bar.sh" ]; then
-    GIT_OUT=$(echo "$INPUT_JSON" | "$SCRIPT_DIR/git_status_bar.sh" --segment "$TARGET_DIR" 2>/dev/null | head -n 1)
+    if [[ "$INPUT_JSON" =~ [^[:space:]] ]]; then
+        GIT_OUT=$(printf '%s\n' "$INPUT_JSON" | "$SCRIPT_DIR/git_status_bar.sh" --segment "$TARGET_DIR" 2>/dev/null | head -n 1)
+    else
+        GIT_OUT=$("$SCRIPT_DIR/git_status_bar.sh" --segment "$TARGET_DIR" </dev/null 2>/dev/null | head -n 1)
+    fi
     GIT_CONTENT=$(echo "$GIT_OUT" | cut -f1)
     GIT_RAW=$(echo "$GIT_OUT" | cut -f2 -s)
+    [ -z "${GIT_CONTENT// /}" ] && GIT_CONTENT=""
+    [ -z "${GIT_RAW// /}" ] && GIT_RAW=""
 fi
 
 # --- Retrieve Timer Segment ---
 TIMER_CONTENT=""
 TIMER_RAW=""
 if [ "$ENABLE_TIMER" = true ] && [ -x "$SCRIPT_DIR/timer_status_bar.sh" ]; then
-    TIMER_OUT=$(echo "$INPUT_JSON" | "$SCRIPT_DIR/timer_status_bar.sh" --segment $TIMER_FLAG 2>/dev/null | head -n 1)
-    TIMER_CONTENT=$(echo "$TIMER_OUT" | cut -f1)
-    TIMER_RAW=$(echo "$TIMER_OUT" | cut -f2 -s)
+    if [[ "$INPUT_JSON" =~ [^[:space:]] ]]; then
+        TIMER_OUT=$(printf '%s\n' "$INPUT_JSON" | "$SCRIPT_DIR/timer_status_bar.sh" --segment $TIMER_FLAG 2>/dev/null | head -n 1)
+    else
+        TIMER_OUT=$("$SCRIPT_DIR/timer_status_bar.sh" --segment $TIMER_FLAG </dev/null 2>/dev/null | head -n 1)
+    fi
+    if [ -n "$TIMER_OUT" ]; then
+        TIMER_CONTENT=$(echo "$TIMER_OUT" | cut -f1)
+        TIMER_RAW=$(echo "$TIMER_OUT" | cut -f2 -s)
+        [ -z "${TIMER_CONTENT// /}" ] && TIMER_CONTENT=""
+        [ -z "${TIMER_RAW// /}" ] && TIMER_RAW=""
+        if [ "$SUPPRESS_PENDING" = true ]; then
+            if [[ "$TIMER_RAW" == *"󱎫 --:--"* && "$TIMER_RAW" == *"󰔛 --"* ]]; then
+                TIMER_CONTENT=""
+                TIMER_RAW=""
+            fi
+        fi
+    fi
 fi
 
 # --- Retrieve Quota Segment ---
@@ -116,13 +141,19 @@ QUOTA_RAW_NO_COUNTDOWN=""
 QUOTA_CONTENT_5H=""
 QUOTA_RAW_5H=""
 if [ "$ENABLE_QUOTA" = true ] && [ -x "$SCRIPT_DIR/quota_status_bar.sh" ]; then
-    QUOTA_OUT=$(echo "$INPUT_JSON" | "$SCRIPT_DIR/quota_status_bar.sh" --segment $QUOTA_FLAG 2>/dev/null | head -n 1)
+    if [[ "$INPUT_JSON" =~ [^[:space:]] ]]; then
+        QUOTA_OUT=$(printf '%s\n' "$INPUT_JSON" | "$SCRIPT_DIR/quota_status_bar.sh" --segment $QUOTA_FLAG 2>/dev/null | head -n 1)
+    else
+        QUOTA_OUT=$("$SCRIPT_DIR/quota_status_bar.sh" --segment $QUOTA_FLAG </dev/null 2>/dev/null | head -n 1)
+    fi
     QUOTA_CONTENT=$(echo "$QUOTA_OUT" | cut -f1)
     QUOTA_RAW=$(echo "$QUOTA_OUT" | cut -f2 -s)
     QUOTA_CONTENT_NO_COUNTDOWN=$(echo "$QUOTA_OUT" | cut -f3 -s)
     QUOTA_RAW_NO_COUNTDOWN=$(echo "$QUOTA_OUT" | cut -f4 -s)
     QUOTA_CONTENT_5H=$(echo "$QUOTA_OUT" | cut -f5 -s)
     QUOTA_RAW_5H=$(echo "$QUOTA_OUT" | cut -f6 -s)
+    [ -z "${QUOTA_CONTENT// /}" ] && QUOTA_CONTENT=""
+    [ -z "${QUOTA_RAW// /}" ] && QUOTA_RAW=""
 fi
 
 # Fallback pattern stripping for quota compaction if tiered fields are not present
