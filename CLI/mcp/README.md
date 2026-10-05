@@ -15,10 +15,8 @@ A zero-dependency terminal UI form editor, diagnostics suite, and CLI manager fo
   - [2. OAuth 2.0 Client Authentication](#2-oauth-20-client-authentication)
   - [3. Lazy Tool Loading vs. Context Bloat](#3-lazy-tool-loading-vs-context-bloat)
   - [4. Background Tool Execution](#4-background-tool-execution)
-  - [5. Sandbox Bypass & Isolation Control](#5-sandbox-bypass--isolation-control)
-  - [6. Tool Namespacing & Prefix Control](#6-tool-namespacing--prefix-control)
 - [Curated Recipes Catalog](#curated-recipes-catalog)
-- [Discovered Tool Inspector](#discovered-tool-inspector)
+- [Discovered Tool Inspector & Tool Toggling](#discovered-tool-inspector--tool-toggling)
 - [Non-Interactive & Scriptable CLI](#non-interactive--scriptable-cli)
 - [Atomic Persistence & Backup Safety](#atomic-persistence--backup-safety)
 
@@ -134,23 +132,29 @@ When you launch `./manage.sh`, you are presented with the **Dashboard View**:
 | **Dashboard** | `[v]` | View discovered cached tools & parameters |
 | **Dashboard** | `[d]` | Delete selected server (with confirmation dialog) |
 | **Dashboard** | `[q]` | Exit manager |
-| **Form Editor** | `[1]` - `[5]` | Jump directly to Tab 1–5 |
+| **Form Editor** | `[1]` - `[4]` | Jump directly to Tab 1–4 |
 | **Form Editor** | `[Tab]` / `[Shift-Tab]` | Cycle forward/backward through tabs |
 | **Form Editor** | `↑` / `↓` | Move selection between fields / table rows |
 | **Form Editor** | `[Enter]` / `[Space]` | Start inline editing or toggle checkbox |
 | **Form Editor** | `[s]` | Save configuration (runs Preflight first) |
 | **Form Editor** | `[Esc]` | Discard changes and return to Dashboard |
 | **Tab 2 (Env/Headers)** | `[m]` | Toggle secret masking (`●●●●` vs plaintext) |
+| **Tab 4 (Preflight)** | `[t]` | Test connection & probe tools live |
 | **Recipes View** | `↑` / `↓` or `k` / `j` | Select recipe in the catalog |
 | **Recipes View** | `[Enter]` | Load selected recipe into Form Editor |
 | **Recipes View** | `[Esc]` / `[q]` | Return to Dashboard |
-| **Tools Viewer** | `↑` / `↓` or `k` / `j` / `PgUp` / `PgDn` | Scroll through cached tool descriptions |
+| **Tools Viewer** | `[Space]` | Toggle tool ON (`[●] ON`) / OFF (`[○] OFF`) |
+| **Tools Viewer** | `[a]` | Enable all tools (All ON) |
+| **Tools Viewer** | `[x]` | Disable all tools (All OFF) |
+| **Tools Viewer** | `[r]` | Refresh & probe tool schemas live |
+| **Tools Viewer** | `↑` / `↓` or `k` / `j` | Navigate tool items |
+| **Tools Viewer** | `[Esc]` / `[q]` | Return to Dashboard |
 
 ---
 
 ## Form Editor: Multi-Tab Guide
 
-The Form Editor isolates server configuration into five logical tabs:
+The Form Editor isolates server configuration into four logical tabs:
 
 ### Tab 1: General & Command
 - **Server Name**: Unique identifier (alphanumeric, `-`, `_`).
@@ -159,8 +163,6 @@ The Form Editor isolates server configuration into five logical tabs:
 - **Command Arguments** *(stdio)*: Space-separated arguments. Safely tokenized with `shlex.split`.
 - **Server URL** *(http)*: Remote endpoint starting with `http://` or `https://`.
 - **Timeout (Seconds)**: Execution timeout (default: `60s`).
-- **Bypass Sandbox**: Enable to bypass AGY's process and filesystem sandbox.
-- **Skip Name Prefix**: Expose tools without the `mcp_<server>_` prefix.
 - **Server State**: Toggle between `ENABLED` and `DISABLED`.
 
 ### Tab 2: Environment Variables & Headers
@@ -177,18 +179,15 @@ The Form Editor isolates server configuration into five logical tabs:
   - `oauth`: Full OAuth 2.0 Client credentials flow.
 - When `oauth` is selected, fields for **OAuth Client ID** and **OAuth Client Secret** are exposed.
 
-### Tab 4: Tooling & Context Optimization
-- **Lazy Tool Loading** (`toolConfig: { eager: false }`): Recommended. Caches schemas on disk and only requests tools when needed. Saves up to 80% prompt context tokens.
-- **Background Execution** (`toolConfig: { background: "ALWAYS" }`): Asynchronously runs long-running tools without blocking the agent.
-- **Tool Namespacing** (`skipToolNamePrefix`): Cleanly namespace or un-namespace tools.
-
-### Tab 5: Preflight Diagnostics & JSON Preview
-- Executes real-time validation checks:
-  - `[✓ PASS]` Valid identifier syntax.
-  - `[✓ PASS]` / `[✗ FAIL]` Executable presence in `$PATH` or HTTP endpoint validation.
+### Tab 4: Preflight Diagnostics & JSON Preview
+- **Tooling & Context Diagnostics**: Reflects Lazy Tool Loading (`toolConfig: { eager: false }`) and Background Execution (`toolConfig: { background: "ALWAYS" }`).
+- **Real-Time Diagnostics**:
+  - `[✓ PASS]` Valid identifier syntax and reachable binaries/endpoints.
+  - `[✗ FAIL]` Missing binary in `$PATH` or invalid URL format.
   - `[ℹ INFO]` Notes regarding ADC or background execution.
   - `[⚠ WARN]` Unreplaced placeholder values or eager tool context bloat.
-- Formatted, syntax-highlighted JSON preview of the exact payload that will be written to `mcp_config.json`.
+- **Live Tool Probe**: Press **`[t]`** to test connectivity and query discovered tools directly from the server.
+- **Syntax-Highlighted Preview**: Exact JSON payload that will be written to `mcp_config.json`.
 - Press **`[Enter]`** or **`[s]`** to commit and save.
 
 ---
@@ -224,7 +223,7 @@ For remote enterprise MCP services supporting OAuth 2.0:
       "clientId": "your-client-id.apps.googleusercontent.com",
       "clientSecret": "your-client-secret"
     },
-    "serverUrl": "https://mcp.internal.corp/sse"
+    "serverUrl": "https://mcp.example.com/sse"
   }
 }
 ```
@@ -276,42 +275,6 @@ When set to `ALWAYS`, tool calls are dispatched to background worker tasks, allo
 
 ---
 
-### 5. Sandbox Bypass & Isolation Control
-
-Antigravity runs local process MCP servers in a sandboxed runtime environment by default. If a server requires unfettered root, Docker daemon, or host network access:
-
-```json
-{
-  "docker-mcp": {
-    "command": "docker",
-    "args": ["run", "-i", "--rm", "mcp/docker"],
-    "bypassSandbox": true
-  }
-}
-```
-
-The TUI flags `bypassSandbox` with a clear security diagnostic warning.
-
----
-
-### 6. Tool Namespacing & Prefix Control
-
-By default, AGY prefixes MCP tools with the server name to avoid collisions:
-`mcp_google-developer-knowledge_answer_query`
-
-To expose tools directly under their raw function name (e.g. `answer_query`):
-
-```json
-{
-  "google-developer-knowledge": {
-    "skipToolNamePrefix": true,
-    "serverUrl": "https://developerknowledge.googleapis.com/mcp"
-  }
-}
-```
-
----
-
 ## Curated Recipes Catalog
 
 Press **`[t]`** in the Dashboard to access ready-to-run templates:
@@ -336,16 +299,20 @@ Selecting any recipe opens the Form Editor with all parameters pre-populated for
 
 ---
 
-## Discovered Tool Inspector
+## Discovered Tool Inspector & Tool Toggling
 
-Press **`[v]`** on any server in the Dashboard to browse the discovered tools cached by AGY under:
+Press **`[v]`** on any server in the Dashboard to browse and configure tools cached under:
 `~/.gemini/antigravity-cli/mcp/<server_name>/*.json`
 
-The viewer displays:
-- Tool names and parameter signatures (required vs optional).
-- Parameter type summaries (`query*: string`, `limit: integer`).
-- Complete documentation descriptions.
-- Scrollable with `↑`, `↓`, `PgUp`, `PgDn`.
+### Interactive Tool Management
+- **Individual Tool Toggling (`[Space]`)**: Toggle specific tools ON (`[●] ON`) or OFF (`[○] OFF`). Disabled tools are persisted to `mcp_config.json` via `disabledTools` so they are not loaded into agent context.
+- **Enable All Tools (`[a]`)**: Turn on all discovered tools with a single keystroke.
+- **Disable All Tools (`[x]`)**: Turn off all tools to temporarily silence the server without removing it.
+- **Live Tool Sync & Probe (`[r]`)**: Probe the server process directly over stdio or HTTP to discover newly added tools and synchronize schemas immediately.
+- **Inspection**:
+  - Tool names and parameter signatures (required vs optional).
+  - Parameter type summaries (`query*: string`, `limit: integer`).
+  - Documentation descriptions with scrollable navigation (`↑`, `↓`, `PgUp`, `PgDn`).
 
 ---
 

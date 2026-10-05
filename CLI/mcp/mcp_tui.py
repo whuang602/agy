@@ -15,6 +15,8 @@ import tty
 import select
 import signal
 import shlex
+import time
+import subprocess
 import urllib.parse
 import re
 import atexit
@@ -40,7 +42,7 @@ _KNOWN_SERVER_KEYS = {
     "authProviderType", "auth_provider", "oauth", "oauthClientId", "oauth_client_id",
     "oauthClientSecret", "oauth_client_secret", "authConfig",
     "toolConfig", "eager", "background", "timeoutSeconds", "timeout_seconds", "timeout",
-    "bypassSandbox", "bypass_sandbox", "skipToolNamePrefix", "skip_tool_name_prefix"
+    "disabledTools", "disabled_tools", "enabledTools", "enabled_tools"
 }
 
 
@@ -362,9 +364,9 @@ def _mask_userinfo(user: str, pw: Optional[str] = None) -> str:
 _ALLOWLISTED_KEYS = {
     "authProviderType", "transport", "command", "args", "env", "headers",
     "serverUrl", "url", "toolConfig", "eager", "background", "timeoutSeconds",
-    "timeout", "bypassSandbox", "skipToolNamePrefix", "disabled", "name",
+    "timeout", "disabled", "name",
     "clientId", "client_id", "oauthClientId", "oauth_client_id",
-    "path", "maxTokens", "max_tokens", "tokens", "bypass_sandbox"
+    "path", "maxTokens", "max_tokens", "tokens"
 }
 
 _PUBLIC_HEADERS_ALLOWLIST = {
@@ -1199,7 +1201,7 @@ _EDITABLE_FIELDS = (
     "transport", "command", "args", "env", "server_url", "headers",
     "auth_provider", "oauth_client_id", "oauth_client_secret",
     "disabled", "timeout_seconds", "eager", "background",
-    "bypass_sandbox", "skip_tool_name_prefix"
+    "disabled_tools"
 )
 _ALL_CLIENT_ID_KEYS = ("clientId", "client_id", "oauthClientId", "oauth_client_id")
 _ALL_CLIENT_SECRET_KEYS = ("clientSecret", "client_secret", "oauthClientSecret", "oauth_client_secret")
@@ -1254,9 +1256,8 @@ class McpServerModel:
     eager: bool = False                       # False = lazy tool loading (token savings)
     background: str = "OFF"                   # "OFF" or "ALWAYS"
     timeout_seconds: int = 60
-    bypass_sandbox: bool = False
-    skip_tool_name_prefix: bool = False
     disabled: bool = False
+    disabled_tools: List[str] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
     explicit_timeout: bool = False
     explicit_transport: bool = False
@@ -1275,8 +1276,7 @@ class McpServerModel:
     _orig_timeout_seconds: Optional[int] = field(default=None, repr=False, compare=False)
     _orig_eager: Optional[bool] = field(default=None, repr=False, compare=False)
     _orig_background: Optional[str] = field(default=None, repr=False, compare=False)
-    _orig_bypass_sandbox: Optional[bool] = field(default=None, repr=False, compare=False)
-    _orig_skip_tool_name_prefix: Optional[bool] = field(default=None, repr=False, compare=False)
+    _orig_disabled_tools: Optional[List[str]] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if self.timeout_seconds != 60:
@@ -1435,9 +1435,8 @@ class McpServerModel:
         except (ValueError, TypeError):
             timeout_seconds = 60
 
-        bypass_sandbox = bool(data.get("bypassSandbox", data.get("bypass_sandbox", False)))
-        skip_tool_name_prefix = bool(data.get("skipToolNamePrefix", data.get("skip_tool_name_prefix", False)))
         disabled = bool(data.get("disabled", False))
+        disabled_tools = cls._str_list(data.get("disabledTools", data.get("disabled_tools", [])))
 
         command = str(data.get("command", "") or "")
         args = cls._str_list(data.get("args"))
@@ -1458,9 +1457,8 @@ class McpServerModel:
             eager=bool(eager),
             background=background,
             timeout_seconds=timeout_seconds,
-            bypass_sandbox=bypass_sandbox,
-            skip_tool_name_prefix=skip_tool_name_prefix,
             disabled=disabled,
+            disabled_tools=disabled_tools,
             extra=extra,
             explicit_timeout=explicit_timeout,
             explicit_transport=explicit_transport,
@@ -1524,11 +1522,8 @@ class McpServerModel:
         if tool_cfg_new:
             result["toolConfig"] = tool_cfg_new
 
-        if self.bypass_sandbox:
-            result["bypassSandbox"] = True
-
-        if self.skip_tool_name_prefix:
-            result["skipToolNamePrefix"] = True
+        if self.disabled_tools:
+            result["disabledTools"] = list(dict.fromkeys(self.disabled_tools))
 
         # Merge unmodeled keys first, allowing modeled keys to take precedence (C1)
         return {**extra_copy, **result}
@@ -1726,22 +1721,13 @@ class McpServerModel:
                 if self.has_changed("background"):
                     res.pop("background", None)
 
-            # Sandbox & Prefix
-            if self.has_changed("bypass_sandbox"):
-                if self.bypass_sandbox:
-                    res["bypassSandbox"] = True
-                    res.pop("bypass_sandbox", None)
+            if self.has_changed("disabled_tools"):
+                if self.disabled_tools:
+                    res["disabledTools"] = list(dict.fromkeys(self.disabled_tools))
+                    res.pop("disabled_tools", None)
                 else:
-                    res.pop("bypassSandbox", None)
-                    res.pop("bypass_sandbox", None)
-
-            if self.has_changed("skip_tool_name_prefix"):
-                if self.skip_tool_name_prefix:
-                    res["skipToolNamePrefix"] = True
-                    res.pop("skip_tool_name_prefix", None)
-                else:
-                    res.pop("skipToolNamePrefix", None)
-                    res.pop("skip_tool_name_prefix", None)
+                    res.pop("disabledTools", None)
+                    res.pop("disabled_tools", None)
 
             return res
 
@@ -2453,12 +2439,6 @@ class PreflightChecker:
         if server.background == "ALWAYS":
             diags.append(Diagnostic("INFO", "Background execution enabled: Long-running tools run asynchronously without stalling turns.", field="background"))
 
-        if server.bypass_sandbox:
-            diags.append(Diagnostic("WARNING", "Sandbox bypass enabled: Process executes outside the Antigravity security sandbox.", field="bypass_sandbox"))
-
-        if server.skip_tool_name_prefix:
-            diags.append(Diagnostic("INFO", "Tool name prefix skipping enabled: Tools exposed directly without server namespace prefix.", field="skip_tool_name_prefix"))
-
         # 5. Timeout
         if server.timeout_seconds <= 0:
             diags.append(Diagnostic("ERROR", "Timeout seconds must be a positive integer.", field="timeout_seconds"))
@@ -2557,6 +2537,219 @@ class PreflightChecker:
     @staticmethod
     def has_errors(diagnostics: List[Diagnostic]) -> bool:
         return any(d.level == "ERROR" for d in diagnostics)
+
+    @staticmethod
+    def probe_server(server: McpServerModel, timeout_seconds: float = 3.0, cache_dir: Optional[str] = None) -> dict:
+        """
+        Actively confirms the validity of the MCP server configuration by initiating
+        a live, non-destructive JSON-RPC handshake (initialize + tools/list).
+        If cache_dir is provided and tools are discovered, persists schemas to disk.
+        Returns a dictionary with status, latency, server info, tools, and raw_tools.
+        """
+        if server.transport == "stdio":
+            if not server.command or not server.command.strip():
+                return {"ok": False, "error": "Cannot test: Executable command is empty."}
+            cmd = [server.command.strip(), *server.args]
+            env = {**os.environ, **server.env}
+            t0 = time.time()
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    text=True
+                )
+            except Exception as e:
+                return {"ok": False, "error": f"Failed to spawn process: {e}"}
+
+            try:
+                # 1. Send initialize
+                init_req = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "agy-tui-probe", "version": "1.0"}
+                    }
+                }
+                proc.stdin.write(json.dumps(init_req) + "\n")
+                proc.stdin.flush()
+
+                deadline = time.time() + timeout_seconds
+                init_line = ""
+                import select
+                while time.time() < deadline:
+                    if proc.poll() is not None:
+                        break
+                    r, _, _ = select.select([proc.stdout], [], [], 0.05)
+                    if r:
+                        init_line = proc.stdout.readline()
+                        break
+
+                if not init_line:
+                    proc.kill()
+                    return {"ok": False, "error": f"Timed out or process exited (exit code {proc.poll()}) waiting for initialize response."}
+
+                init_res = json.loads(init_line)
+                srv_info = init_res.get("result", {}).get("serverInfo", {})
+
+                # 2. Send initialized notification & tools/list
+                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n")
+                proc.stdin.flush()
+
+                tools_line = ""
+                while time.time() < deadline:
+                    r, _, _ = select.select([proc.stdout], [], [], 0.05)
+                    if r:
+                        tools_line = proc.stdout.readline()
+                        break
+
+                tools = []
+                raw_tools = []
+                if tools_line:
+                    try:
+                        tools_res = json.loads(tools_line)
+                        raw_tools = tools_res.get("result", {}).get("tools", [])
+                        tools = [t.get("name") for t in raw_tools if isinstance(t, dict) and t.get("name")]
+                        if cache_dir and raw_tools and server.name:
+                            target_dir = os.path.join(cache_dir, server.name)
+                            os.makedirs(target_dir, exist_ok=True)
+                            for t in raw_tools:
+                                t_name = t.get("name")
+                                if t_name:
+                                    t_path = os.path.join(target_dir, f"{t_name}.json")
+                                    with open(t_path, "w", encoding="utf-8") as tf:
+                                        json.dump(t, tf, indent=2)
+                    except Exception:
+                        pass
+
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+                proc.terminate()
+                try:
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    proc.kill()
+
+                latency = round((time.time() - t0) * 1000, 1)
+                return {
+                    "ok": True,
+                    "latency_ms": latency,
+                    "server_name": srv_info.get("name", "unnamed"),
+                    "server_version": srv_info.get("version", "unknown"),
+                    "tools": tools,
+                    "raw_tools": raw_tools
+                }
+            except Exception as e:
+                try:
+                    if proc.stdin: proc.stdin.close()
+                    if proc.stdout: proc.stdout.close()
+                    if proc.stderr: proc.stderr.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return {"ok": False, "error": f"Communication error: {e}"}
+
+        elif server.transport == "http":
+            if not server.server_url or not server.server_url.strip():
+                return {"ok": False, "error": "Cannot test: Server URL is empty."}
+            t0 = time.time()
+            import urllib.request
+            import urllib.error
+            headers = {"Content-Type": "application/json", **server.headers}
+            init_req_data = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "agy-tui-probe", "version": "1.0"}
+                }
+            }).encode("utf-8")
+            req = urllib.request.Request(server.server_url, data=init_req_data, headers=headers, method="POST")
+            try:
+                status = 200
+                srv_info = {}
+                with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                    status = resp.status
+                    data = resp.read().decode("utf-8", errors="replace")
+                    try:
+                        res_json = json.loads(data)
+                        srv_info = res_json.get("result", {}).get("serverInfo", {})
+                    except Exception:
+                        pass
+
+                # Probe tools on HTTP endpoint
+                tools = []
+                raw_tools = []
+                tools_req_data = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/list",
+                }).encode("utf-8")
+                tools_req = urllib.request.Request(server.server_url, data=tools_req_data, headers=headers, method="POST")
+                try:
+                    with urllib.request.urlopen(tools_req, timeout=timeout_seconds) as resp2:
+                        data2 = resp2.read().decode("utf-8", errors="replace")
+                        tools_json = json.loads(data2)
+                        raw_tools = tools_json.get("result", {}).get("tools", [])
+                        tools = [t.get("name") for t in raw_tools if isinstance(t, dict) and t.get("name")]
+                        if cache_dir and raw_tools and server.name:
+                            target_dir = os.path.join(cache_dir, server.name)
+                            os.makedirs(target_dir, exist_ok=True)
+                            for t in raw_tools:
+                                t_name = t.get("name")
+                                if t_name:
+                                    t_path = os.path.join(target_dir, f"{t_name}.json")
+                                    with open(t_path, "w", encoding="utf-8") as tf:
+                                        json.dump(t, tf, indent=2)
+                except Exception:
+                    pass
+
+                latency = round((time.time() - t0) * 1000, 1)
+                return {
+                    "ok": True,
+                    "latency_ms": latency,
+                    "server_name": srv_info.get("name", "remote-http"),
+                    "server_version": srv_info.get("version", f"HTTP {status}"),
+                    "tools": tools,
+                    "raw_tools": raw_tools
+                }
+            except urllib.error.HTTPError as e:
+                latency = round((time.time() - t0) * 1000, 1)
+                if e.code in (401, 403):
+                    return {
+                        "ok": True,
+                        "latency_ms": latency,
+                        "server_name": "remote-auth-required",
+                        "server_version": f"HTTP {e.code}",
+                        "tools": [],
+                        "raw_tools": []
+                    }
+                return {"ok": False, "error": f"HTTP error {e.code}: {e.reason}"}
+            except Exception as e:
+                return {"ok": False, "error": f"Connection failed: {e}"}
+
+        return {"ok": False, "error": f"Unsupported transport: {server.transport}"}
 
 
 # ==============================================================================
@@ -2769,12 +2962,13 @@ class McpManagerApp:
         self.form_server: Optional[McpServerModel] = None
         self.form_original_name: Optional[str] = None
         self.form_is_new = False
-        self.form_tab = 1  # 1 to 5
+        self.form_tab = 1  # 1 to 4
         self.form_field_idx = 0
         self.editing_field = False
         self.edit_buffer = ""
         self.mask_secrets = True
         self.form_dirty = False
+        self.last_probe_result: Optional[dict] = None
 
         # Tab 2 (Env / Headers table) selection state (C5, M6)
         self.table_row_idx = 0
@@ -2789,6 +2983,7 @@ class McpManagerApp:
         self.tools_list: List[ToolInfo] = []
         self.tools_server_name = ""
         self.tools_scroll_offset = 0
+        self.tools_selected_idx = 0
 
         # Modals state
         self.delete_target = ""
@@ -2922,6 +3117,7 @@ class McpManagerApp:
                 self.mask_secrets = True
                 self.table_row_idx = 0
                 self.table_col_idx = 0
+                self.last_probe_result = None
                 self.view = "form"
         elif key in ("a", "A"):
             self.form_server = McpServerModel(name="new-mcp-server", transport="stdio", command="npx")
@@ -2934,6 +3130,7 @@ class McpManagerApp:
             self.mask_secrets = True
             self.table_row_idx = 0
             self.table_col_idx = 0
+            self.last_probe_result = None
             self.view = "form"
         elif key in ("t", "T"):
             self.recipes_idx = 0
@@ -2944,8 +3141,36 @@ class McpManagerApp:
                 name = self.server_keys[self.dash_selected_idx]
                 self.tools_server_name = name
                 self.tools_list = self.tool_reader.get_tools(name)
+                # Auto-sync on open if tools not cached yet and server is enabled
+                if not self.tools_list:
+                    srv = self.servers.get(name)
+                    cache_dir = getattr(self.tool_reader, "base_dir", None)
+                    if srv and not srv.disabled and cache_dir:
+                        try:
+                            PreflightChecker.probe_server(srv, timeout_seconds=1.5, cache_dir=cache_dir)
+                            self.tools_list = self.tool_reader.get_tools(name)
+                            self.load_data()
+                        except Exception:
+                            pass
+                self.tools_selected_idx = 0
                 self.tools_scroll_offset = 0
                 self.view = "tools"
+        elif key in ("r", "R"):
+            cache_dir = getattr(self.tool_reader, "base_dir", None)
+            msg = "Refreshed MCP configuration and tool schemas."
+            if total > 0 and self.dash_selected_idx < total:
+                sel_name = self.server_keys[self.dash_selected_idx]
+                sel_srv = self.servers.get(sel_name)
+                if sel_srv and not sel_srv.disabled and cache_dir:
+                    try:
+                        probe = PreflightChecker.probe_server(sel_srv, timeout_seconds=1.5, cache_dir=cache_dir)
+                        if probe.get("ok"):
+                            tool_cnt = len(probe.get("tools", []))
+                            msg = f"Refreshed: discovered {tool_cnt} tool(s) for '{sel_name}'."
+                    except Exception:
+                        pass
+            self.load_data()
+            self.set_status(msg)
         elif key in ("d", "D"):
             if total > 0 and self.dash_selected_idx < total:
                 self.delete_target = self.server_keys[self.dash_selected_idx]
@@ -2968,9 +3193,9 @@ class McpManagerApp:
         # Responsive column layout strictly within width (M5)
         col_st = 9
         col_tr = 8
-        col_tools = 9
+        col_tools = 13
         col_auth = 13
-        fixed_sum = col_st + col_tr + col_tools + col_auth + 6  # 45 + margins
+        fixed_sum = col_st + col_tr + col_tools + col_auth + 6  # 49 + margins
         remaining = max(24, width - fixed_sum)
         col_name = min(22, remaining // 2)
         col_cmd = max(12, remaining - col_name)
@@ -2980,7 +3205,7 @@ class McpManagerApp:
             f"{'SERVER NAME':<{col_name}}"
             f"{'TRANS':<{col_tr}}"
             f"{'COMMAND / URL':<{col_cmd}}"
-            f"{'TOOLS':<{col_tools}}"
+            f"{pad_visible('TOOLS', col_tools, align='center')}"
             f"{'AUTH':<{col_auth}}{c.RESET}"
         )
         lines.append(truncate_visible(th, width))
@@ -3013,7 +3238,14 @@ class McpManagerApp:
                 cmd_val = _format_masked_cmd_or_url(srv)
 
                 t_count = self.cached_tool_counts.get(name, 0)
-                t_str = f"{t_count:>2} tools" if t_count > 0 else f"{c.DIM} 0 tools{c.RESET}"
+                disabled_cnt = len(srv.disabled_tools) if srv.disabled_tools else 0
+                active_cnt = max(0, t_count - disabled_cnt)
+                if t_count == 0:
+                    t_str = f"{c.DIM}0 tools{c.RESET}"
+                elif disabled_cnt > 0:
+                    t_str = f"{c.YELLOW}{active_cnt}/{t_count} tools{c.RESET}"
+                else:
+                    t_str = f"{t_count} tools"
 
                 if srv.auth_provider == "google_credentials":
                     auth_str = f"{c.GREEN}Google ADC{c.RESET}"
@@ -3040,7 +3272,7 @@ class McpManagerApp:
                     f"{pad_visible(disp_title, col_name)}"
                     f"{pad_visible(tr_pill, col_tr)}"
                     f"{pad_visible(disp_cmd, col_cmd)}"
-                    f"{pad_visible(t_str, col_tools)}"
+                    f"{pad_visible(t_str, col_tools, align='center')}"
                     f"{pad_visible(auth_str, col_auth)}"
                 )
 
@@ -3051,15 +3283,27 @@ class McpManagerApp:
                 lines.append("")
 
         lines.append(f"{c.GRAY}{'─' * width}{c.RESET}")
-        keymap = (
-            f" {c.BOLD}[Space]{c.RESET} Toggle  "
-            f"{c.BOLD}[e/Enter]{c.RESET} Edit  "
-            f"{c.BOLD}[a]{c.RESET} Add  "
-            f"{c.BOLD}[t]{c.RESET} Recipes  "
-            f"{c.BOLD}[v]{c.RESET} Tools  "
-            f"{c.BOLD}[d]{c.RESET} Delete  "
-            f"{c.BOLD}[q]{c.RESET} Quit"
-        )
+        if width >= 90:
+            keymap = (
+                f" {c.BOLD}[Space]{c.RESET} Toggle  "
+                f"{c.BOLD}[e/Enter]{c.RESET} Edit  "
+                f"{c.BOLD}[a]{c.RESET} Add  "
+                f"{c.BOLD}[t]{c.RESET} Recipes  "
+                f"{c.BOLD}[v]{c.RESET} Tools  "
+                f"{c.BOLD}[r]{c.RESET} Refresh  "
+                f"{c.BOLD}[d]{c.RESET} Delete  "
+                f"{c.BOLD}[q]{c.RESET} Quit"
+            )
+        else:
+            keymap = (
+                f" {c.BOLD}[Space]{c.RESET} Toggle  "
+                f"{c.BOLD}[e]{c.RESET} Edit  "
+                f"{c.BOLD}[a]{c.RESET} Add  "
+                f"{c.BOLD}[v]{c.RESET} Tools  "
+                f"{c.BOLD}[r]{c.RESET} Refresh  "
+                f"{c.BOLD}[d]{c.RESET} Del  "
+                f"{c.BOLD}[q]{c.RESET} Quit"
+            )
         lines.append(truncate_visible(keymap, width))
 
         if self.status_msg:
@@ -3109,7 +3353,7 @@ class McpManagerApp:
             return
 
         # Jump between tabs
-        if key in ("1", "2", "3", "4", "5"):
+        if key in ("1", "2", "3", "4"):
             self.form_tab = int(key)
             self.form_field_idx = 0
             return
@@ -3126,11 +3370,11 @@ class McpManagerApp:
 
         # Tab navigation
         if key == "TAB":
-            self.form_tab = (self.form_tab % 5) + 1
+            self.form_tab = (self.form_tab % 4) + 1
             self.form_field_idx = 0
             return
         if key == "BACKTAB":
-            self.form_tab = 5 if self.form_tab == 1 else self.form_tab - 1
+            self.form_tab = 4 if self.form_tab == 1 else self.form_tab - 1
             self.form_field_idx = 0
             return
 
@@ -3143,13 +3387,11 @@ class McpManagerApp:
             self.handle_tab3_key(key)
         elif self.form_tab == 4:
             self.handle_tab4_key(key)
-        elif self.form_tab == 5:
-            self.handle_tab5_key(key)
 
     def handle_tab1_key(self, key: str):
         srv = self.form_server
         is_stdio = (srv.transport == "stdio")
-        total_fields = 8 if is_stdio else 7
+        total_fields = 6 if is_stdio else 5
 
         if key in ("UP", "k", "K"):
             self.form_field_idx = (self.form_field_idx - 1) % total_fields
@@ -3172,12 +3414,6 @@ class McpManagerApp:
                 elif idx == 4:
                     self.start_edit_buffer(str(srv.timeout_seconds))
                 elif idx == 5:
-                    srv.bypass_sandbox = not srv.bypass_sandbox
-                    self.form_dirty = True
-                elif idx == 6:
-                    srv.skip_tool_name_prefix = not srv.skip_tool_name_prefix
-                    self.form_dirty = True
-                elif idx == 7:
                     srv.disabled = not srv.disabled
                     self.form_dirty = True
             else:
@@ -3186,12 +3422,6 @@ class McpManagerApp:
                 elif idx == 3:
                     self.start_edit_buffer(str(srv.timeout_seconds))
                 elif idx == 4:
-                    srv.bypass_sandbox = not srv.bypass_sandbox
-                    self.form_dirty = True
-                elif idx == 5:
-                    srv.skip_tool_name_prefix = not srv.skip_tool_name_prefix
-                    self.form_dirty = True
-                elif idx == 6:
                     srv.disabled = not srv.disabled
                     self.form_dirty = True
 
@@ -3257,25 +3487,20 @@ class McpManagerApp:
                 self.start_edit_buffer(srv.oauth_client_secret)
 
     def handle_tab4_key(self, key: str):
-        srv = self.form_server
-        total_fields = 3
-        if key in ("UP", "k", "K"):
-            self.form_field_idx = (self.form_field_idx - 1) % total_fields
-        elif key in ("DOWN", "j", "J"):
-            self.form_field_idx = (self.form_field_idx + 1) % total_fields
-        elif key in ("SPACE", "ENTER"):
-            if self.form_field_idx == 0:
-                srv.eager = not srv.eager
-                self.form_dirty = True
-            elif self.form_field_idx == 1:
-                srv.background = "ALWAYS" if srv.background == "OFF" else "OFF"
-                self.form_dirty = True
-            elif self.form_field_idx == 2:
-                srv.skip_tool_name_prefix = not srv.skip_tool_name_prefix
-                self.form_dirty = True
-
-    def handle_tab5_key(self, key: str):
-        if key in ("ENTER", "s", "S"):
+        if key in ("t", "T"):
+            self.set_status("Testing live MCP server connection...")
+            cache_dir = getattr(self.tool_reader, "base_dir", None) if hasattr(self, "tool_reader") else None
+            self.last_probe_result = PreflightChecker.probe_server(self.form_server, cache_dir=cache_dir)
+            if self.last_probe_result.get("ok"):
+                tool_cnt = len(self.last_probe_result.get("tools", []))
+                s_name = self.last_probe_result.get("server_name", "server")
+                lat = self.last_probe_result.get("latency_ms", 0)
+                if hasattr(self, "cached_tool_counts") and self.form_server.name:
+                    self.cached_tool_counts[self.form_server.name] = tool_cnt
+                self.set_status(f"Live probe PASS: '{s_name}' connected in {lat}ms ({tool_cnt} tool(s) found).")
+            else:
+                self.set_status("Live probe FAILED. See details in Preflight view.", is_error=True)
+        elif key in ("ENTER", "s", "S"):
             self.save_form()
         elif key in ("c", "C", "ESCAPE"):
             if self.form_dirty:
@@ -3355,7 +3580,7 @@ class McpManagerApp:
         srv = self.form_server
         diags = PreflightChecker.validate_server(srv, config_path=self.config_mgr.config_path)
         if PreflightChecker.has_errors(diags):
-            self.form_tab = 5
+            self.form_tab = 4
             self.set_status("Cannot save: Please fix the preflight errors shown below.", is_error=True)
             return
 
@@ -3378,6 +3603,15 @@ class McpManagerApp:
             else:
                 is_new = (self.form_original_name is None)
                 self.config_mgr.set_server(srv, overwrite=overwrite, is_new=is_new)
+
+            # If enabled and we don't have cached tools yet, attempt a quick probe to cache schemas
+            cache_dir = getattr(self.tool_reader, "base_dir", None) if hasattr(self, "tool_reader") else None
+            if not srv.disabled and cache_dir and self.tool_reader.get_tool_count(srv.name) == 0:
+                try:
+                    PreflightChecker.probe_server(srv, timeout_seconds=2.0, cache_dir=cache_dir)
+                except Exception:
+                    pass
+
             self.load_data()
             self.form_dirty = False
             self.view = "dashboard"
@@ -3397,8 +3631,7 @@ class McpManagerApp:
             (1, "General"),
             (2, "Env & Headers"),
             (3, "Authentication"),
-            (4, "Tooling & Context"),
-            (5, "Preflight & Preview"),
+            (4, "Preflight & Preview"),
         ]
         tab_line = " "
         for num, label in tabs:
@@ -3417,9 +3650,7 @@ class McpManagerApp:
         elif self.form_tab == 3:
             content_lines = self._render_tab3(srv, width)
         elif self.form_tab == 4:
-            content_lines = self._render_tab4(srv, width)
-        elif self.form_tab == 5:
-            content_lines = self._render_tab5(srv, width, height)
+            content_lines = self._render_tab4(srv, width, height)
 
         max_content = max(5, height - 7)
         for cl in content_lines[:max_content]:
@@ -3430,9 +3661,17 @@ class McpManagerApp:
         lines.append(f"{c.GRAY}{'─' * width}{c.RESET}")
         if self.editing_field:
             footer = f" {c.GREEN}{c.BOLD}EDITING:{c.RESET} [Enter] Commit  [Esc] Cancel  (Type to edit)"
+        elif self.form_tab == 4:
+            footer = (
+                f" {c.BOLD}[1-4]{c.RESET} Tabs  "
+                f"{c.BOLD}[t]{c.RESET} Test Server  "
+                f"{c.BOLD}[m]{c.RESET} Mask  "
+                f"{c.BOLD}[s]{c.RESET} Save  "
+                f"{c.BOLD}[Esc]{c.RESET} Cancel"
+            )
         else:
             footer = (
-                f" {c.BOLD}[1-5]{c.RESET} Tabs  "
+                f" {c.BOLD}[1-4]{c.RESET} Tabs  "
                 f"{c.BOLD}[↑/↓]{c.RESET} Select  "
                 f"{c.BOLD}[Enter/Space]{c.RESET} Edit  "
                 f"{c.BOLD}[m]{c.RESET} Mask  "
@@ -3493,16 +3732,12 @@ class McpManagerApp:
             args_str = sanitize_display(" ".join(shlex.quote(a) for a in redact_args(srv.args))) if srv.args else "<none>"
             out.append(item(3, "Command Arguments", args_str, f"Parsed: {len(srv.args)} args"))
             out.append(item(4, "Timeout (Seconds)", str(srv.timeout_seconds), "Default: 60s"))
-            out.append(item(5, "Bypass Sandbox", "[x] YES" if srv.bypass_sandbox else "[ ] NO", "Run outside sandbox"))
-            out.append(item(6, "Skip Name Prefix", "[x] YES" if srv.skip_tool_name_prefix else "[ ] NO", "Direct tool names"))
-            out.append(item(7, "Server State", "[x] DISABLED" if srv.disabled else "[ ] ENABLED", "Toggle active state"))
+            out.append(item(5, "Server State", "[x] DISABLED" if srv.disabled else "[ ] ENABLED", "Toggle active state"))
         else:
             safe_url = sanitize_display(_redact_single_url(srv.server_url)) if srv.server_url else "<empty>"
             out.append(item(2, "Server URL", safe_url, "HTTP / HTTPS endpoint"))
             out.append(item(3, "Timeout (Seconds)", str(srv.timeout_seconds), "Default: 60s"))
-            out.append(item(4, "Bypass Sandbox", "[x] YES" if srv.bypass_sandbox else "[ ] NO", "Run outside sandbox"))
-            out.append(item(5, "Skip Name Prefix", "[x] YES" if srv.skip_tool_name_prefix else "[ ] NO", "Direct tool names"))
-            out.append(item(6, "Server State", "[x] DISABLED" if srv.disabled else "[ ] ENABLED", "Toggle active state"))
+            out.append(item(4, "Server State", "[x] DISABLED" if srv.disabled else "[ ] ENABLED", "Toggle active state"))
 
         return out
 
@@ -3623,39 +3858,7 @@ class McpManagerApp:
         return out
 
 
-    def _render_tab4(self, srv: McpServerModel, width: int) -> List[str]:
-        c = Colors
-        out = []
-
-        out.append(f" {c.BOLD}Tooling, Context & Concurrency Optimization{c.RESET}")
-        out.append(f"{c.GRAY}{'─' * (width - 2)}{c.RESET}")
-
-        is_sel_0 = (self.form_field_idx == 0)
-        lazy_status = f"{c.GREEN}[x] LAZY LOADING (Recommended){c.RESET}" if not srv.eager else f"{c.YELLOW}[ ] EAGER LOADING (Context Bloat){c.RESET}"
-        if is_sel_0:
-            lazy_status = f"{c.INVERT} {lazy_status} {c.RESET}"
-        out.append(f"  Tool Discovery Mode  : {lazy_status}")
-        out.append(f"    {c.DIM}Lazy mode caches schemas locally and loads on demand, saving up to 80% prompt tokens.{c.RESET}")
-        out.append("")
-
-        is_sel_1 = (self.form_field_idx == 1)
-        bg_status = f"{c.CYAN}[x] ALWAYS (Asynchronous){c.RESET}" if srv.background == "ALWAYS" else f"{c.DIM}[ ] OFF (Synchronous){c.RESET}"
-        if is_sel_1:
-            bg_status = f"{c.INVERT} {bg_status} {c.RESET}"
-        out.append(f"  Background Execution : {bg_status}")
-        out.append(f"    {c.DIM}When ALWAYS, long-running tools run asynchronously without stalling agent turns.{c.RESET}")
-        out.append("")
-
-        is_sel_2 = (self.form_field_idx == 2)
-        prefix_status = f"{c.YELLOW}[x] SKIP PREFIX (Direct Names){c.RESET}" if srv.skip_tool_name_prefix else f"{c.GREEN}[ ] PREFIX WITH SERVER NAME{c.RESET}"
-        if is_sel_2:
-            prefix_status = f"{c.INVERT} {prefix_status} {c.RESET}"
-        out.append(f"  Tool Namespacing     : {prefix_status}")
-        out.append(f"    {c.DIM}When skipped, tools are exposed directly as 'tool_name' without server namespace.{c.RESET}")
-
-        return out
-
-    def _render_tab5(self, srv: McpServerModel, width: int, height: int) -> List[str]:
+    def _render_tab4(self, srv: McpServerModel, width: int, height: int) -> List[str]:
         c = Colors
         out = []
 
@@ -3676,6 +3879,23 @@ class McpManagerApp:
             else:
                 badge = f"{c.RED}{c.BOLD}[✗ FAIL]{c.RESET}"
             out.append(f"  {badge} {d.message}")
+
+        out.append("")
+        out.append(f" {c.BOLD}Live Server Handshake & Tool Probe:{c.RESET}")
+        if self.last_probe_result is None:
+            out.append(f"  {c.DIM}[ℹ INFO] Press [t] to test live handshake and query tools before saving.{c.RESET}")
+        elif self.last_probe_result.get("ok"):
+            res = self.last_probe_result
+            s_name = res.get("server_name", "unnamed")
+            s_ver = res.get("server_version", "")
+            lat = res.get("latency_ms", 0)
+            tools = res.get("tools", [])
+            tools_str = ", ".join(tools) if tools else "<no tools declared>"
+            out.append(f"  {c.GREEN}[✓ PASS] Handshake Successful ({lat}ms){c.RESET} Server: {s_name} {s_ver}")
+            out.append(f"    {c.CYAN}Discovered {len(tools)} tool(s):{c.RESET} {tools_str}")
+        else:
+            err = self.last_probe_result.get("error", "Unknown error")
+            out.append(f"  {c.RED}{c.BOLD}[✗ FAIL] Handshake Failed:{c.RESET} {err}")
 
         out.append("")
         mask_notice = f" {c.DIM}(Secrets masked; press [m] to toggle){c.RESET}" if self.mask_secrets else ""
@@ -3759,48 +3979,137 @@ class McpManagerApp:
         return lines
 
     # --------------------------------------------------------------------------
-    # View 4: Discovered Tools Viewer (M6)
+    # View 4: Discovered Tools Viewer (Interactive Toggling & Mass Controls)
     # --------------------------------------------------------------------------
     def handle_tools_key(self, key: str):
+        total_tools = len(self.tools_list)
+        srv = self.servers.get(self.tools_server_name)
+
         if key in ("q", "Q", "ESCAPE"):
             self.view = "dashboard"
+            return
         elif key in ("UP", "k", "K"):
-            self.tools_scroll_offset = max(0, self.tools_scroll_offset - 1)
+            if total_tools > 0:
+                self.tools_selected_idx = max(0, self.tools_selected_idx - 1)
         elif key in ("DOWN", "j", "J"):
-            self.tools_scroll_offset += 1
-
+            if total_tools > 0:
+                self.tools_selected_idx = min(total_tools - 1, self.tools_selected_idx + 1)
         elif key == "PAGEUP":
-            self.tools_scroll_offset = max(0, self.tools_scroll_offset - 10)
+            if total_tools > 0:
+                self.tools_selected_idx = max(0, self.tools_selected_idx - 5)
         elif key == "PAGEDOWN":
-            self.tools_scroll_offset += 10
+            if total_tools > 0:
+                self.tools_selected_idx = min(total_tools - 1, self.tools_selected_idx + 5)
+        elif key in ("SPACE", "ENTER"):
+            if srv and total_tools > 0 and self.tools_selected_idx < total_tools:
+                t_name = self.tools_list[self.tools_selected_idx].name
+                cur_disabled = list(srv.disabled_tools)
+                if t_name in cur_disabled:
+                    cur_disabled = [x for x in cur_disabled if x != t_name]
+                    action_str = "enabled"
+                else:
+                    cur_disabled.append(t_name)
+                    action_str = "disabled"
+                srv.disabled_tools = list(dict.fromkeys(cur_disabled))
+                try:
+                    self.config_mgr.set_server(srv, is_new=False)
+                    self.load_data()
+                    self.set_status(f"Tool '{t_name}' {action_str} on '{srv.name}'.")
+                except Exception as e:
+                    self.set_status(f"Error updating tool: {e}", is_error=True)
+        elif key in ("a", "A", "e", "E"):
+            # Enable all tools
+            if srv and total_tools > 0:
+                srv.disabled_tools = []
+                try:
+                    self.config_mgr.set_server(srv, is_new=False)
+                    self.load_data()
+                    self.set_status(f"All {total_tools} tools enabled on '{srv.name}'.")
+                except Exception as e:
+                    self.set_status(f"Error enabling tools: {e}", is_error=True)
+        elif key in ("x", "X", "d", "D"):
+            # Disable all tools
+            if srv and total_tools > 0:
+                srv.disabled_tools = [t.name for t in self.tools_list]
+                try:
+                    self.config_mgr.set_server(srv, is_new=False)
+                    self.load_data()
+                    self.set_status(f"All {total_tools} tools disabled on '{srv.name}'.")
+                except Exception as e:
+                    self.set_status(f"Error disabling tools: {e}", is_error=True)
+        elif key in ("r", "R"):
+            if self.tools_server_name:
+                srv_live = self.servers.get(self.tools_server_name)
+                cache_dir = getattr(self.tool_reader, "base_dir", None)
+                if srv_live and not srv_live.disabled and cache_dir:
+                    try:
+                        PreflightChecker.probe_server(srv_live, timeout_seconds=1.5, cache_dir=cache_dir)
+                    except Exception:
+                        pass
+                self.tools_list = self.tool_reader.get_tools(self.tools_server_name)
+                self.load_data()
+                self.set_status(f"Refreshed tools for '{self.tools_server_name}' ({len(self.tools_list)} found).")
 
     def render_tools(self, width: int, height: int) -> List[str]:
         lines = []
         c = Colors
 
+        srv = self.servers.get(self.tools_server_name)
+        disabled_set = set(srv.disabled_tools) if srv else set()
+        total_cnt = len(self.tools_list)
+        disabled_cnt = len(disabled_set.intersection({t.name for t in self.tools_list}))
+        active_cnt = max(0, total_cnt - disabled_cnt)
+
         srv_name = sanitize_display(self.tools_server_name)
-        title = f" DISCOVERED CACHED TOOLS: {srv_name} ({len(self.tools_list)} tools) "
+        title = f" MCP TOOLS: {srv_name} ({active_cnt}/{total_cnt} active) "
         lines.append(f"{c.BG_CYAN}{c.BLACK}{c.BOLD}{title.center(width)}{c.RESET}")
-        lines.append(f" {c.DIM}Schemas cached under ~/.gemini/antigravity-cli/mcp/{srv_name}/{c.RESET}")
+        lines.append(f" {c.DIM}Schemas cached under ~/.gemini/antigravity-cli/mcp/{srv_name}/  |  Config: {self.config_mgr.config_path}{c.RESET}")
         lines.append(f"{c.GRAY}{'─' * width}{c.RESET}")
 
         body_lines: List[str] = []
+        tool_starts: List[int] = []
+
         if not self.tools_list:
             body_lines.append("")
             body_lines.append(f"  {c.YELLOW}No cached tool schemas found for '{srv_name}'.{c.RESET}")
             body_lines.append(f"  {c.DIM}Schemas are discovered and cached when AGY connects to the MCP server.{c.RESET}")
+            body_lines.append(f"  {c.DIM}Press [r] to probe and sync tools now.{c.RESET}")
         else:
-            for t in self.tools_list:
+            for idx, t in enumerate(self.tools_list):
+                tool_starts.append(len(body_lines))
+                is_sel = (idx == self.tools_selected_idx)
+                is_disabled = (t.name in disabled_set)
+
+                cursor = f"{c.CYAN}{c.BOLD}❯{c.RESET} " if is_sel else "  "
+                if is_disabled:
+                    st_pill = f"{c.GRAY}[○] OFF{c.RESET}"
+                else:
+                    st_pill = f"{c.GREEN}{c.BOLD}[●] ON {c.RESET}"
+
                 t_name = sanitize_display(t.name)
                 t_params = sanitize_display(t.parameters_summary)
-                body_lines.append(f"  {c.GREEN}{c.BOLD}▶ {t_name}{c.RESET}  {c.CYAN}({t_params}){c.RESET}")
+
+                if is_sel:
+                    disp_name = f"{c.BOLD}{c.CYAN}{c.UNDERLINE}{t_name}{c.RESET}"
+                else:
+                    disp_name = f"{c.BOLD}{t_name}{c.RESET}"
+
+                body_lines.append(f"{cursor}{st_pill} {disp_name}  {c.CYAN}({t_params}){c.RESET}")
+
                 if t.description:
                     first_line = sanitize_display(t.description.splitlines()[0])
-                    body_lines.append(f"    {c.DIM}{first_line[:width - 6]}{c.RESET}")
+                    body_lines.append(f"      {c.DIM}{first_line[:max(10, width - 8)]}{c.RESET}")
                 body_lines.append("")
 
         max_items = max(5, height - 7)
-        # Bounded clamping for tools scroll offset (M6)
+        if tool_starts and self.tools_selected_idx < len(tool_starts):
+            sel_start = tool_starts[self.tools_selected_idx]
+            item_len = 3 if (self.tools_selected_idx < len(self.tools_list) and self.tools_list[self.tools_selected_idx].description) else 2
+            if sel_start < self.tools_scroll_offset:
+                self.tools_scroll_offset = sel_start
+            elif sel_start + item_len > self.tools_scroll_offset + max_items:
+                self.tools_scroll_offset = max(0, sel_start + item_len - max_items)
+
         max_scroll = max(0, len(body_lines) - max_items)
         self.tools_scroll_offset = max(0, min(self.tools_scroll_offset, max_scroll))
 
@@ -3811,7 +4120,23 @@ class McpManagerApp:
             lines.append("")
 
         lines.append(f"{c.GRAY}{'─' * width}{c.RESET}")
-        lines.append(truncate_visible(f" {c.BOLD}[↑/↓/PgUp/PgDn]{c.RESET} Scroll  {c.BOLD}[Esc/q]{c.RESET} Back to Dashboard", width))
+        keymap = (
+            f" {c.BOLD}[Space]{c.RESET} Toggle  "
+            f"{c.BOLD}[a]{c.RESET} All ON  "
+            f"{c.BOLD}[x]{c.RESET} All OFF  "
+            f"{c.BOLD}[r]{c.RESET} Refresh  "
+            f"{c.BOLD}[↑/↓]{c.RESET} Navigate  "
+            f"{c.BOLD}[Esc/q]{c.RESET} Back"
+        )
+        lines.append(truncate_visible(keymap, width))
+
+        if self.status_msg:
+            status_color = f"{c.RED}{c.BOLD}" if self.status_is_error else f"{c.GREEN}{c.BOLD}"
+            st_line = f" {status_color}▶ {self.status_msg}{c.RESET}"
+        else:
+            st_line = f" {c.DIM}Active tools: {active_cnt} / {total_cnt}{c.RESET}"
+        lines.append(truncate_visible(st_line, width))
+
         return lines
 
     # --------------------------------------------------------------------------
@@ -3965,14 +4290,14 @@ def run_cli_list(config_mgr: ConfigManager, as_json: bool = False, show_secrets:
     col_name = 28
     col_st = 10
     col_tr = 11
-    col_tools = 10
+    col_tools = 13
     col_auth = 16
 
     header = (
         f"{c.BOLD}{'NAME':<{col_name}} "
         f"{'STATUS':<{col_st}} "
         f"{'TRANSPORT':<{col_tr}} "
-        f"{'TOOLS':<{col_tools}} "
+        f"{pad_visible('TOOLS', col_tools, align='center')} "
         f"{'AUTH':<{col_auth}} "
         f"{'COMMAND / URL'}{c.RESET}"
     )
@@ -3984,7 +4309,14 @@ def run_cli_list(config_mgr: ConfigManager, as_json: bool = False, show_secrets:
         status_disp = f"{c.GREEN}[●] ON {c.RESET}" if not srv.disabled else f"{c.GRAY}[○] OFF{c.RESET}"
         tr_disp = f"{c.MAGENTA}stdio{c.RESET}" if srv.transport == "stdio" else f"{c.BLUE}http {c.RESET}"
         t_count = tool_reader.get_tool_count(name)
-        tool_disp = f"{t_count:>2} tools" if t_count > 0 else f"{c.DIM} 0 tools{c.RESET}"
+        disabled_cnt = len(srv.disabled_tools) if srv.disabled_tools else 0
+        active_cnt = max(0, t_count - disabled_cnt)
+        if t_count == 0:
+            tool_disp = f"{c.DIM}0 tools{c.RESET}"
+        elif disabled_cnt > 0:
+            tool_disp = f"{c.YELLOW}{active_cnt}/{t_count} tools{c.RESET}"
+        else:
+            tool_disp = f"{t_count} tools"
 
         if srv.auth_provider == "google_credentials":
             auth_disp = f"{c.GREEN}Google ADC{c.RESET}"
@@ -4004,7 +4336,7 @@ def run_cli_list(config_mgr: ConfigManager, as_json: bool = False, show_secrets:
             f"{pad_visible(f'{c.BOLD}{safe_name}{c.RESET}', col_name)} "
             f"{pad_visible(status_disp, col_st)} "
             f"{pad_visible(tr_disp, col_tr)} "
-            f"{pad_visible(tool_disp, col_tools)} "
+            f"{pad_visible(tool_disp, col_tools, align='center')} "
             f"{pad_visible(auth_disp, col_auth)} "
             f"{target}"
         )
