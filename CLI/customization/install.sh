@@ -545,8 +545,8 @@ install_customizations() {
 
     # Verify source files exist
     for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh; do
-        if [ ! -f "$SCRIPT_DIR/$script_file" ]; then
-            echo -e "${RED}Error: Required script $SCRIPT_DIR/$script_file not found.${RESET}" >&2
+        if [ ! -f "$SCRIPT_DIR/status_bar/$script_file" ]; then
+            echo -e "${RED}Error: Required script $SCRIPT_DIR/status_bar/$script_file not found.${RESET}" >&2
             exit 1
         fi
     done
@@ -559,7 +559,7 @@ install_customizations() {
         echo -e "  ${GREEN}✓${RESET} Target directory: ${BOLD}$GLOBAL_SCRIPTS_DIR${RESET}"
 
         for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh; do
-            cp "$SCRIPT_DIR/$script_file" "$GLOBAL_SCRIPTS_DIR/" || {
+            cp "$SCRIPT_DIR/status_bar/$script_file" "$GLOBAL_SCRIPTS_DIR/" || {
                 echo -e "${RED}Error: Failed to copy $script_file to $GLOBAL_SCRIPTS_DIR${RESET}" >&2
                 exit 1
             }
@@ -574,7 +574,7 @@ install_customizations() {
         echo -e "  ${GREEN}✓${RESET} Target directory: ${BOLD}$WORKSPACE_SCRIPTS_DIR${RESET}"
 
         for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh; do
-            cp "$SCRIPT_DIR/$script_file" "$WORKSPACE_SCRIPTS_DIR/" || {
+            cp "$SCRIPT_DIR/status_bar/$script_file" "$WORKSPACE_SCRIPTS_DIR/" || {
                 echo -e "${RED}Error: Failed to copy $script_file to $WORKSPACE_SCRIPTS_DIR${RESET}" >&2
                 exit 1
             }
