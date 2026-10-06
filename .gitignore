@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local orchestration & agent workflows
+.orchestration/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Logs & Temporary Files
+*.log
+
+# MCP Manager local state, backups, and locks
+mcp_config.json*
+*.bak.*
+.mcp_config.lock
+.mcp_config.*.tmp
+
+# Credentials, secrets, and keys
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+credentials.json
+application_default_credentials.json
+service-account*.json
+

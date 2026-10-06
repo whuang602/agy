@@ -1,6 +1,6 @@
 # AGY CLI Customizations: Status Line Modules
 
-A modular suite of dynamic TUI status line customizations for Google Antigravity (AGY) CLI. These scripts display real-time Git status, total session elapsed time, prompt-to-action round durations, and consumer account daily request quota directly inside your terminal interface.
+A modular suite of dynamic TUI status line customizations for Google Antigravity (AGY) CLI. These scripts display real-time Git status, total session elapsed time, prompt-to-action round durations, consumer account daily request quota, and context window token consumption directly inside your terminal interface.
 
 ---
 
@@ -10,28 +10,30 @@ Each module can be used **standalone** (rendering its own bordered line) or comb
 
 | Script                     | Purpose                                                                           | Standalone Preview                                                                                 |
 | :------------------------- | :-------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------- |
-| **`status_bar.sh`**        | **Unified status line** composing Git + Timers + Quota in separate `[ ]` brackets | `───[  main │ 0 staged │ 0 unstaged │ ✓ synced ]───[ 󱎫 14m 32s │ 󰔛 3.8s ]───[ 󱓞 91.5% (5h) · 80.8% (wk) │ 󰔟 1h 59m ]───` |
+| **`status_bar.sh`**        | **Unified status line** composing Git + Timers + Quota + Context in separate brackets | `───[  main │ 0 staged │ 0 unstaged │ ✓ synced ]───[ 󱎫 14m 32s │ 󰔛 3.8s ]───[ 󱓞 91.5% (5h) · 80.8% (wk) │ 󰔟 1h 59m ]───[ 󰍛 65k (6.5%) ]───` |
 | **`git_status_bar.sh`**    | Real-time Git branch, staging, untracked & remote sync (ahead/behind/diverged)    | `───[  main │ 0 staged │ 0 unstaged │ ✓ synced ]───────────────────────────────────────────────────` |
 | **`timer_status_bar.sh`**  | Session uptime + prompt-to-action completion round timer                          | `───[ 󱎫 14m 32s │ 󰔛 3.8s ]─────────────────────────────────────────────────────────────────────────`   |
 | **`quota_status_bar.sh`**  | Consumer Google account dual-window request quota % and 5-hour reset countdown     | `───[ 󱓞 91.5% (5h) · 80.8% (wk) │ 󰔟 1h 59m ]───────────────────────────────────────────────────────`   |
+| **`context_status_bar.sh`**| Context window token consumption, capacity limit, and usage percentage            | `───[ 󰍛 65k (6.5%) ]─────────────────────────────────────────────────────────────────────────────`   |
 
 ---
 
 ## Features
 
 ### 1. Unified Status Bar (`status_bar.sh`)
-- **Modular Segment Composition**: Composes up to three active segments (`[ Git ]───[ Timer ]───[ Quota ]`) connected on the same visual line.
-- **Dynamic Segment Suppression**: Cleanly omits bracket capsules and separators for any disabled or empty segment (e.g. when Quota is suppressed on enterprise accounts or Git is outside a repository).
+- **Modular Segment Composition**: Composes up to four active segments (`[ Git ]───[ Timer ]───[ Quota ]───[ Context ]`) connected on the same visual line.
+- **Dynamic Segment Suppression**: Cleanly omits bracket capsules and separators for any disabled or empty segment (e.g. when Quota is suppressed on enterprise accounts, context is pending, or Git is outside a repository).
 - **Width-Aware Progressive Degradation**: Automatically compacts segments on narrow terminal viewports (e.g., 100-col and 80-col terminals) to prevent line wrapping:
   1. Clamps `FILL_LEN` floor to 0 (never forces padding when space is tight).
   2. If line exceeds terminal width, drops the reset countdown (`│ 󰔟 ...`) to save ~12 columns.
   3. If still too wide, drops the weekly quota badge, retaining only 5h demand badge (`󱓞 91.5% (5h)`).
-  4. If still too wide, drops the entire quota segment.
-  5. If still too wide, drops the timer segment.
+  4. If still too wide, compacts context segment to short format (`󰍛 65k`), or drops context segment.
+  5. If still too wide, drops the entire quota segment.
+  6. If still too wide, drops the timer segment.
 - **Clean Empty Suppression**: When all enabled segments are empty/suppressed (e.g. an enterprise user with quota-only), cleanly exits 0 with zero stdout instead of rendering a meaningless `───[ AGY ]───` placeholder.
 - **Terminal Width Bounds**: Clamps terminal `WIDTH` to `[20, 1000]` across all scripts, eliminating memory exhaustion or hangs from unbounded terminal sizes.
 - **Payload Forwarding**: Preserves and pipes the AGY CLI stdin JSON payload to downstream segment scripts.
-- **Customization Flags**: Supports `--no-git`, `--no-timer`, `--no-quota`, `--digital`, `--verbose`, and `--compact`.
+- **Customization Flags**: Supports `--no-git`, `--no-timer`, `--no-quota`, `--no-context`, `--context`, `--digital`, `--verbose`, and `--compact`.
 
 ### 2. Consumer Account Quota (`quota_status_bar.sh`)
 - **Dual-Window Display (5-Hour & Weekly Limits)**: Renders both the 5-hour rolling demand window (`5h`) and total weekly capacity window (`wk`) side-by-side separated by a dim middle dot (`·`): `󱓞 91.5% (5h) · 80.8% (wk) │ 󰔟 1h 59m`.
@@ -94,6 +96,27 @@ Each module can be used **standalone** (rendering its own bordered line) or comb
   - `local` when no remote tracking branch is configured.
   - `unknown` when git rev-list fails or exits non-zero (never false `✓ synced`).
 - **Graceful Fallback**: Displays `Git: not a repository` when outside a Git directory while clamping terminal padding safely (`[20, 1000]`, non-overflowing fill).
+
+### 5. Context Window Tracker (`context_status_bar.sh`)
+- **Authoritative Transcript Extraction**: Scans the latest `PLANNER_RESPONSE` step in `transcript.jsonl` to calculate active context window tokens: `input_tokens + cache_read_tokens`.
+- **Stdin Precedence**: Automatically prioritizes direct token numbers if piped on stdin (`.context_tokens`, `.tokens.total`, `.tokens.input`, `.usage.total_tokens`).
+- **Model Capacity Resolution**: Automatically detects model limits from `.model.id` or `.model.display_name`:
+  - **Gemini models** (`gemini-3.8`, `gemini-2.5`, `flash`, `pro`): `1,000,000` (1M tokens).
+  - **Claude models** (`claude-3-7`, `claude-3-5`, `sonnet`, `opus`): `200,000` (200k tokens).
+  - **OpenAI models** (`gpt-4o`, `gpt-4`, `o1`, `o3`, `codex`): `128,000` (128k tokens).
+  - **Fallback Default**: `1,000,000` (1M tokens).
+  - **Environment Override**: `AGY_CONTEXT_LIMIT` (positive integer).
+- **Dynamic Color Thresholds**:
+  - Green: `< 60%` consumed.
+  - Yellow: `60% – 84%` consumed.
+  - Red: `≥ 85%` consumed.
+- **Display Modes**:
+  - `compact` (default): Glyph-rich display (`󰍛 65k (6.5%)`).
+  - `verbose`: Worded display (`ctx: 65k/1M (6.5%)`).
+  - `short`: Abbreviated badge for narrow viewports (`󰍛 65k`).
+- **Path Traversal Protection**: Strictly validates `conversation_id` against `^[A-Za-z0-9_-]{1,64}$`, rejecting path traversal (`../`) and unauthorized filesystem access.
+- **Clean Pending Suppression**: Supports `--suppress-pending` to suppress output entirely (exit 0) when no active conversation or response is present.
+- **Server Billing & Compaction Alignment (Caveat vs. `/context`)**: The status bar tracks the **official prompt tokens billed by the model API** (`input_tokens + cache_read_tokens`), which is the exact standard AGY evaluates for context compaction and server limits. By contrast, the interactive `/context` slash command provides a client-side category breakdown using a `chars / 4` estimate for unmeasured steps, which may differ slightly (~0.5%) from the true billed token count shown here.
 
 ---
 
@@ -186,7 +209,7 @@ The installer provides:
 You can automate installation or select specific modules with CLI flags:
 
 ```bash
-# Install all modules (Git, Timer, Quota) globally
+# Install all modules (Git, Timer, Quota, Context) globally
 ./CLI/customization/install.sh --all -y
 
 # Install only Git status
@@ -195,8 +218,14 @@ You can automate installation or select specific modules with CLI flags:
 # Install only Consumer Account Quota
 ./CLI/customization/install.sh --quota-only -y
 
-# Install Git and Timer without Quota
+# Install only Context Window module
+./CLI/customization/install.sh --context-only -y
+
+# Install without Quota
 ./CLI/customization/install.sh --no-quota -y
+
+# Install without Context Window
+./CLI/customization/install.sh --no-context -y
 
 # Install with digital timer format
 ./CLI/customization/install.sh --all --digital -y
@@ -234,7 +263,7 @@ chmod +x ~/.gemini/antigravity-cli/scripts/*.sh
 
 Add the `statusLine` configuration to `~/.gemini/antigravity-cli/settings.json`:
 
-##### Option A: Unified Status Bar (Git + Timer + Quota - Recommended)
+##### Option A: Unified Status Bar (Git + Timer + Quota + Context - Recommended)
 ```json
 {
   "statusLine": {
@@ -286,6 +315,19 @@ Add the `statusLine` configuration to `~/.gemini/antigravity-cli/settings.json`:
 }
 ```
 
+##### Option E: Standalone Context Window Only
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.gemini/antigravity-cli/scripts/context_status_bar.sh",
+    "interval": 2,
+    "enabled": true,
+    "stack_with_default": true
+  }
+}
+```
+
 #### 3. Live Activation via Slash Command
 
 You can also switch or test configurations live in the AGY CLI with the slash command:
@@ -326,7 +368,7 @@ The uninstall routine automatically:
 1. Verifies ownership of `statusLine.command` before modifying `settings.json`. If a third-party command is configured, leaves it untouched and logs a warning.
 2. Creates an automatic backup copy `~/.gemini/antigravity-cli/settings.json.bak` before any modification.
 3. Atomically removes our `statusLine` configuration while preserving file permissions and all other configuration keys (`model`, `toolPermission`, `trustedWorkspaces`, etc.).
-4. Deletes installed scripts (`status_bar.sh`, `git_status_bar.sh`, `timer_status_bar.sh`, `quota_status_bar.sh`) from `~/.gemini/antigravity-cli/scripts/` without disturbing other user scripts.
+4. Deletes installed scripts (`status_bar.sh`, `git_status_bar.sh`, `timer_status_bar.sh`, `quota_status_bar.sh`, `context_status_bar.sh`) from `~/.gemini/antigravity-cli/scripts/` without disturbing other user scripts.
 5. Deletes the same scripts from `.agents/scripts/` if present in the workspace, removing the directory if empty.
 6. Purges temporary session cache files (`~/.cache/antigravity/session_*` and `agy_sess_*`).
 7. Advises restarting `agy` to restore the default status line.
@@ -339,4 +381,4 @@ The uninstall routine automatically:
 - **Python 3** (v3.8+)
 - **jq** (for fast JSON transcript and stdin parsing)
 - **Git**
-- A **Nerd Font** or Powerline-compatible font (for ``, `󱎫`, `󰔛`, `󱐋`, `󱓞`, `󰔟`, `✓`, `⚠`, `↑`, `↓`, `↕`)
+- A **Nerd Font** or Powerline-compatible font (for ``, `󱎫`, `󰔛`, `󱐋`, `󱓞`, `󰔟`, `󰍛`, `✓`, `⚠`, `↑`, `↓`, `↕`)
