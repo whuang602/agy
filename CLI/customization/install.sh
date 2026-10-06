@@ -32,15 +32,17 @@ SHOW_CURSOR="\033[?25h"
 # Index 0: Git Status Module
 # Index 1: Session & Round Timers
 # Index 2: Consumer Account Quota
-# Index 3: Digital Timer Format
-# Index 4: Stack With Default Bar
-# Index 5: Global Installation (~/.gemini/antigravity-cli/scripts/)
-# Index 6: Local Workspace Copy (.agents/scripts/)
-# Index 7: Configure settings.json
+# Index 3: Context Window Module
+# Index 4: Digital Timer Format
+# Index 5: Stack With Default Bar
+# Index 6: Global Installation (~/.gemini/antigravity-cli/scripts/)
+# Index 7: Local Workspace Copy (.agents/scripts/)
+# Index 8: Configure settings.json
 OPTIONS_LABEL=(
     "Git Status Module           Real-time branch, staged, unstaged & remote sync"
     "Session & Round Timers      Session duration & live prompt execution stopwatch"
     "Consumer Account Quota      Display daily requests % & reset countdown"
+    "Context Window Module       Display context window tokens used & capacity"
     "Digital Timer Format        Display timers as 01:23:45 instead of 1h 23m 45s"
     "Stack With Default Bar      Keep AGY model/token status line visible"
     "Global Installation         Install to ~/.gemini/antigravity-cli/scripts/ (recommended)"
@@ -48,7 +50,7 @@ OPTIONS_LABEL=(
     "Configure settings.json     Auto-update ~/.gemini/antigravity-cli/settings.json"
 )
 
-SELECTED=(1 1 1 0 1 1 0 1)
+SELECTED=(1 1 1 1 0 1 1 0 1)
 CURRENT_INDEX=0
 TOTAL_ITEMS=${#OPTIONS_LABEL[@]}
 NON_INTERACTIVE=false
@@ -66,12 +68,15 @@ Interactive Mode:
   Run without arguments in a terminal to launch the interactive TUI.
 
 Options:
-  --all               Enable Git, Timer, and Quota modules [default]
+  --all               Enable Git, Timer, Quota, and Context modules [default]
   --git-only          Enable only Git status module
   --timer-only        Enable only Session & Round timer module
   --quota-only        Enable only Consumer Account Quota module
+  --context-only      Enable only Context Window module
   --quota             Enable Consumer Account Quota module
   --no-quota          Disable Consumer Account Quota module
+  --context           Enable Context Window module
+  --no-context        Disable Context Window module
   --digital           Enable digital timer style (HH:MM:SS)
   --verbose           Enable verbose timer style (e.g. 14m 32s) [default]
   --stack             Stack with default status bar [default]
@@ -126,7 +131,7 @@ except Exception as e:
     sys.exit(1)
 
 sl = data.get("statusLine")
-ours = ("status_bar.sh", "git_status_bar.sh", "timer_status_bar.sh", "quota_status_bar.sh")
+ours = ("status_bar.sh", "git_status_bar.sh", "timer_status_bar.sh", "quota_status_bar.sh", "context_status_bar.sh")
 cmd = (sl or {}).get("command", "") if isinstance(sl, dict) else ""
 
 if sl is None:
@@ -168,7 +173,7 @@ PYEOF
     fi
 
     # 2. Remove customization scripts from global scripts directory
-    local custom_scripts=("status_bar.sh" "git_status_bar.sh" "timer_status_bar.sh" "quota_status_bar.sh")
+    local custom_scripts=("status_bar.sh" "git_status_bar.sh" "timer_status_bar.sh" "quota_status_bar.sh" "context_status_bar.sh")
     local removed_global=0
     if [ -d "$GLOBAL_SCRIPTS_DIR" ]; then
         for script in "${custom_scripts[@]}"; do
@@ -241,6 +246,7 @@ while [ $# -gt 0 ]; do
             SELECTED[0]=1
             SELECTED[1]=1
             SELECTED[2]=1
+            SELECTED[3]=1
             NON_INTERACTIVE=true
             shift
             ;;
@@ -248,6 +254,7 @@ while [ $# -gt 0 ]; do
             SELECTED[0]=1
             SELECTED[1]=0
             SELECTED[2]=0
+            SELECTED[3]=0
             NON_INTERACTIVE=true
             shift
             ;;
@@ -255,6 +262,7 @@ while [ $# -gt 0 ]; do
             SELECTED[0]=0
             SELECTED[1]=1
             SELECTED[2]=0
+            SELECTED[3]=0
             NON_INTERACTIVE=true
             shift
             ;;
@@ -262,6 +270,15 @@ while [ $# -gt 0 ]; do
             SELECTED[0]=0
             SELECTED[1]=0
             SELECTED[2]=1
+            SELECTED[3]=0
+            NON_INTERACTIVE=true
+            shift
+            ;;
+        --context-only)
+            SELECTED[0]=0
+            SELECTED[1]=0
+            SELECTED[2]=0
+            SELECTED[3]=1
             NON_INTERACTIVE=true
             shift
             ;;
@@ -275,40 +292,50 @@ while [ $# -gt 0 ]; do
             NON_INTERACTIVE=true
             shift
             ;;
-        --digital)
+        --context)
             SELECTED[3]=1
             NON_INTERACTIVE=true
             shift
             ;;
-        --verbose)
+        --no-context)
             SELECTED[3]=0
             NON_INTERACTIVE=true
             shift
             ;;
-        --stack)
+        --digital)
             SELECTED[4]=1
             NON_INTERACTIVE=true
             shift
             ;;
-        --no-stack)
+        --verbose)
             SELECTED[4]=0
             NON_INTERACTIVE=true
             shift
             ;;
-        --global)
+        --stack)
             SELECTED[5]=1
-            SELECTED[6]=0
             NON_INTERACTIVE=true
             shift
             ;;
-        --workspace)
-            SELECTED[6]=1
+        --no-stack)
             SELECTED[5]=0
             NON_INTERACTIVE=true
             shift
             ;;
-        --no-settings)
+        --global)
+            SELECTED[6]=1
             SELECTED[7]=0
+            NON_INTERACTIVE=true
+            shift
+            ;;
+        --workspace)
+            SELECTED[7]=1
+            SELECTED[6]=0
+            NON_INTERACTIVE=true
+            shift
+            ;;
+        --no-settings)
+            SELECTED[8]=0
             NON_INTERACTIVE=true
             shift
             ;;
@@ -338,7 +365,8 @@ render_preview() {
     local has_git=${SELECTED[0]}
     local has_timer=${SELECTED[1]}
     local has_quota=${SELECTED[2]}
-    local is_digital=${SELECTED[3]}
+    local has_context=${SELECTED[3]}
+    local is_digital=${SELECTED[4]}
 
     local prev_segments=()
     if [ "$has_git" -eq 1 ]; then
@@ -353,6 +381,9 @@ render_preview() {
     fi
     if [ "$has_quota" -eq 1 ]; then
         prev_segments+=("${GREEN}󱓞 91.5% (5h) ${GRAY}· ${GREEN}80.8% (wk) ${GRAY}│ 󰔟 1h 59m")
+    fi
+    if [ "$has_context" -eq 1 ]; then
+        prev_segments+=("${GREEN}󰍛 65k (6.5%)")
     fi
 
     if [ ${#prev_segments[@]} -eq 0 ]; then
@@ -517,15 +548,16 @@ install_customizations() {
     local has_git=${SELECTED[0]}
     local has_timer=${SELECTED[1]}
     local has_quota=${SELECTED[2]}
-    local is_digital=${SELECTED[3]}
-    local stack_default=${SELECTED[4]}
-    local install_global=${SELECTED[5]}
-    local install_workspace=${SELECTED[6]}
-    local update_settings=${SELECTED[7]}
+    local has_context=${SELECTED[3]}
+    local is_digital=${SELECTED[4]}
+    local stack_default=${SELECTED[5]}
+    local install_global=${SELECTED[6]}
+    local install_workspace=${SELECTED[7]}
+    local update_settings=${SELECTED[8]}
 
-    if [ "$has_git" -eq 0 ] && [ "$has_timer" -eq 0 ] && [ "$has_quota" -eq 0 ]; then
+    if [ "$has_git" -eq 0 ] && [ "$has_timer" -eq 0 ] && [ "$has_quota" -eq 0 ] && [ "$has_context" -eq 0 ]; then
         echo -e "${RED}Error: No status line modules were selected.${RESET}"
-        echo "Please select at least one of Git, Timer, or Quota to install."
+        echo "Please select at least one of Git, Timer, Quota, or Context to install."
         exit 1
     fi
 
@@ -544,7 +576,7 @@ install_customizations() {
     done
 
     # Verify source files exist
-    for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh; do
+    for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh context_status_bar.sh; do
         if [ ! -f "$SCRIPT_DIR/status_bar/$script_file" ]; then
             echo -e "${RED}Error: Required script $SCRIPT_DIR/status_bar/$script_file not found.${RESET}" >&2
             exit 1
@@ -558,7 +590,7 @@ install_customizations() {
         mkdir -p "$GLOBAL_SCRIPTS_DIR"
         echo -e "  ${GREEN}✓${RESET} Target directory: ${BOLD}$GLOBAL_SCRIPTS_DIR${RESET}"
 
-        for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh; do
+        for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh context_status_bar.sh; do
             cp "$SCRIPT_DIR/status_bar/$script_file" "$GLOBAL_SCRIPTS_DIR/" || {
                 echo -e "${RED}Error: Failed to copy $script_file to $GLOBAL_SCRIPTS_DIR${RESET}" >&2
                 exit 1
@@ -573,7 +605,7 @@ install_customizations() {
         mkdir -p "$WORKSPACE_SCRIPTS_DIR"
         echo -e "  ${GREEN}✓${RESET} Target directory: ${BOLD}$WORKSPACE_SCRIPTS_DIR${RESET}"
 
-        for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh; do
+        for script_file in status_bar.sh git_status_bar.sh timer_status_bar.sh quota_status_bar.sh context_status_bar.sh; do
             cp "$SCRIPT_DIR/status_bar/$script_file" "$WORKSPACE_SCRIPTS_DIR/" || {
                 echo -e "${RED}Error: Failed to copy $script_file to $WORKSPACE_SCRIPTS_DIR${RESET}" >&2
                 exit 1
@@ -594,7 +626,7 @@ install_customizations() {
         base_path=".agents/scripts"
     fi
 
-    local total_mods=$(( has_git + has_timer + has_quota ))
+    local total_mods=$(( has_git + has_timer + has_quota + has_context ))
 
     if [ "$total_mods" -eq 1 ]; then
         if [ "$has_git" -eq 1 ]; then
@@ -604,12 +636,15 @@ install_customizations() {
             [ "$is_digital" -eq 1 ] && script_args+=("--digital")
         elif [ "$has_quota" -eq 1 ]; then
             script_name="quota_status_bar.sh"
+        elif [ "$has_context" -eq 1 ]; then
+            script_name="context_status_bar.sh"
         fi
     else
         script_name="status_bar.sh"
         [ "$has_git" -eq 0 ] && script_args+=("--no-git")
         [ "$has_timer" -eq 0 ] && script_args+=("--no-timer")
         [ "$has_quota" -eq 0 ] && script_args+=("--no-quota")
+        [ "$has_context" -eq 0 ] && script_args+=("--no-context")
         [ "$is_digital" -eq 1 ] && script_args+=("--digital")
     fi
 
@@ -713,7 +748,7 @@ PYEOF
     local -a test_cmd=("$raw_script_path" "${script_args[@]}")
     echo -e "  Executing: ${DIM}${test_cmd[*]}${RESET}"
     echo -ne "  Output:    "
-    local sample_payload='{"cwd":"'"$PWD"'","model":{"id":"gemini-3.8-flash","display_name":"Gemini 3.8 Flash"},"quota":{"gemini-5h":{"remaining_fraction":0.915,"reset_in_seconds":7148},"gemini-weekly":{"remaining_fraction":0.808,"reset_in_seconds":470000}}}'
+    local sample_payload='{"cwd":"'"$PWD"'","model":{"id":"gemini-3.8-flash","display_name":"Gemini 3.8 Flash"},"context_tokens":65000,"quota":{"gemini-5h":{"remaining_fraction":0.915,"reset_in_seconds":7148},"gemini-weekly":{"remaining_fraction":0.808,"reset_in_seconds":470000}}}'
     echo "$sample_payload" | "${test_cmd[@]}" 2>/dev/null || "${test_cmd[@]}" < /dev/null || true
 
     # 6. Final Summary
